@@ -1,0 +1,414 @@
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field, fields, astuple
+from typing import Optional, Tuple, Dict, Any
+import fenics as fs
+import numpy as np
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class material_properties_2d:
+    """
+        Dataclass containing the material properties for a 2D Fenics problem.
+
+    Attributes:
+        density:        Material density p  [kg/m³]
+        e_modulus:      Young's modulus     [Pa]
+        poisson_ratio:  v                   [1]
+    Properties:
+        shear_modulus:  µ                   [Pa] 
+    Notes:
+        µ calculated from poisson's ratio and E-modulus.
+    Raises:
+        ValueError: When inputs are negative or poisson ratio is outside (0,0.5].
+    """
+    density: float
+    e_modulus: float
+    poisson_ratio: float
+    
+    _shear_modulus: Optional[float] = field(default=None, init=False)
+
+    @property
+    def shear_modulus(self):
+        if self._shear_modulus is not None:
+            return self._shear_modulus
+        else:
+            shear_modulus_calculated = self.e_modulus / (2*(1+self.poisson_ratio))
+            object.__setattr__(self, "_shear_modulus", shear_modulus_calculated)
+        return self._shear_modulus
+
+    @property
+    def lame_lambda(self):
+        return self.e_modulus*self.poisson_ratio/((1+self.poisson_ratio)*(1-2*self.poisson_ratio))
+
+    def __post_init__(self):
+        if self.e_modulus <= 0:
+            raise ValueError("Youngs modulus cannot be <= 0")
+        if self.poisson_ratio <= 0 or self.poisson_ratio > 0.5:
+            raise ValueError(f"Poisson ratio cannot be {self.poisson_ratio} as it should be within 0 and 0.5")
+        if  self.shear_modulus <= 0:
+            raise ValueError(f"Shear modulus must be above 0. Shear modulus was {self.shear_modulus}.")
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class geometry_properties_2d:
+    """
+    Dataclass containing the geometry properties for a 2D Fenics problem.
+
+    Attributes:
+        length:         [m]
+        height:         [m]
+        width:          [m]
+    Properties:
+        volume:         [m³]
+        area_moment:    [m⁴]
+        section_area:   [m²]
+    Raises:
+        ValueError: When inputs are negative.
+    """
+    length: float
+    height: float
+    width: float
+    
+    @property
+    def volume(self)->float:
+        return self.length*self.height*self.width
+    
+    @property
+    def area_moment(self):
+        return self.width*self.height**3/12
+    
+    @property
+    def section_area(self):
+        return self.height*self.width
+    
+    def __post_init__(self): #This function checks for values being > 0.
+        for attribute in fields(self):
+            if getattr(self, attribute.name) <= 0:
+                raise ValueError(f"The attribute {str(attribute.name)} has negative values of {getattr(self, attribute.name)}")
+
+@dataclass(frozen=True, kw_only=True)
+class load_case_2d:
+    """
+    Dataclass storing the load cases (traction and body forces) as fenics.Constant to be used in a beam class. 
+    The coordinate directions x and y are positive right and up respectively.
+
+    Attributes:
+        gravity_accel:
+        gravity_dir:
+        general_force:
+        traction:
+        name:
+    Properties:
+        traction_forces:
+    Notes:
+        Use traction_forces to get the fenics.Constant object.
+    Raises:
+        RuntimeError: When use_gravity is False and body_forces() is called.
+        ValueError: When traction is not provided and traction_forces() is called.
+    """
+    use_gravity: bool = False
+    gravity_accel: float = 9.81
+    gravity_dir: Optional[Tuple[float, float]] = None
+    general_force: Optional[Dict] = None
+    traction: Optional[Tuple[float, float]] = None
+    name: Optional[str] = None
+
+    def body_forces(self, density: float):
+        """
+        Calculates body forces and returns fs.Constant object.
+
+        Raises:
+            RuntimeError: When use_gravity is False and body_forces() is called.
+        """
+        if self.use_gravity:
+            gravity_force = self.gravity_accel*density
+            if self.gravity_dir is None:
+                return fs.Constant((0.0, -gravity_force))    
+            else:
+                gx, gy = self.gravity_dir
+                return fs.Constant((gx*gravity_force, gy*gravity_force)) 
+        else:
+            raise RuntimeError(f"use_gravity is {self.use_gravity} but body_forces was called. Decide if gravity is present and try again")
+    
+    @property
+    def traction_forces(self):
+        """
+        Generates fenics.Constant object from the attribute traction.
+        
+        Raises:
+            ValueError: When traction is not provided.
+        """
+        if self.traction is not None:
+            return fs.Constant(self.traction)
+        else:
+            raise ValueError("Traction not specified")
+        
+    def __post_init__(self): #This function handles not implemented general force and informs about gravity
+        if self.general_force is not None:
+            raise NotImplementedError("This has not yet been implemented")
+        if self.gravity_dir != (0.0, -1.0) or self.gravity_accel != 9.81:
+            print(f"The gravity direction is {self.gravity_dir} with magnitude {self.gravity_accel}")
+
+@dataclass(slots=True, kw_only=True)
+class cantilever_beam_2d_linear:
+    """
+    Dataclass that stores and calculates the standard cantilevered beam with left side fixed and right side load.
+    fixed from (0.0,0.0) to (0.0, height) and load from (length,0.0) to (length, height).
+    use material and geometry classes to describe properties. 
+
+    Attributes:
+        material_properties:    class like material_properties_2d
+        geometry_properties:    class like geometry_properties_2d
+        loads:
+        mesh_size:
+    Properties:
+        mesh:                   fenics.RectangleMesh
+        von_mises:              fenics.Projection onto post-processing scalar field
+        displacement_magnitude: fenics.Projection onto post-processing scalar field
+        euler_deflection:       float   - calculate y-deflection from standard formula dir- is down
+        is_linear:              bool    - is deflection within 1% of length
+    Notes:
+        y-direction is positive upwards meaning that deflection downwards will be negative.
+    Raises:
+        RuntimeError: When von_mises or displacement_magnitude is run before solve()
+    """
+    material_properties: material_properties_2d
+    geometry_properties: geometry_properties_2d
+    loads: load_case_2d
+    mesh_size: Optional[Tuple[int, int]] = None
+
+    _mesh: Optional[Any] = field(default=None, init=False, repr=False)
+    _function_space: Optional[Any] = field(default=None, init=False, repr=False)
+    _trial_function: Optional[Any] = field(default=None, init=False, repr=False)
+    _test_function: Optional[Any] = field(default=None, init=False, repr=False)
+
+    _boundary_area: Optional[Any] = field(default=None, init=False, repr=False)
+    _external_load: Optional[Any] = field(default=None, init=False, repr=False)
+    _boundary_conditions: Optional[Any] = field(default=None, init=False, repr=False)
+    _boundary_applied_areas: Optional[Any] = field(default=False, init=False, repr=False)
+
+    _displacement_field: Optional[Any] = field(default=None, init=False, repr=False)
+    _bilinear_lhs: Optional[Any] = field(default=None, repr=False)
+    _loading_rhs: Optional[Any] = field(default=None, repr=False)
+    _stress_field: Optional[Any] = field(default=None, init=False, repr=False)
+
+    _post_scalar_field: Optional[Any] = field(default=None, init=False, repr=False)
+    _displacement_magnitude: Optional[Any] = field(default=None, init=False, repr=False)
+    _von_mises: Optional[Any] = field(default=None, init=False, repr=False)
+
+    def __post_init__(self): #Initializes mesh size to height/50 if it has not been set already.
+        if self.mesh_size is None:
+            size = self.geometry_properties.height/50
+            mesh_number_length = int(self.geometry_properties.length/size)
+            mesh_number_height = int(self.geometry_properties.height/size)
+            self.mesh_size = (mesh_number_length, mesh_number_height)
+            print(f"Mesh size autocalculated to {size*1000} mm for x and y")
+        #print(f"mesh_size={self.mesh_size}") #debug
+
+    @staticmethod
+    def strains(trial_function):
+        """
+        Calculates strains for the trial function u.
+        """
+        return 0.5*(fs.grad(trial_function)+fs.grad(trial_function).T)    
+
+    def stresses(self, trial_function):
+        """
+        Calculates stresses for the trial function u.
+        """
+        epsilon = self.strains(trial_function)
+        shear_modulus = self.material_properties.shear_modulus
+        dimensions = trial_function.geometric_dimension()
+        return self.material_properties.lame_lambda*fs.tr(epsilon)*fs.Identity(dimensions)+2*shear_modulus*epsilon
+
+    @property
+    def mesh(self):
+        if self._mesh is not None:
+            return self._mesh
+        else:
+            length = self.geometry_properties.length
+            height = self.geometry_properties.height
+            self._mesh = fs.RectangleMesh(fs.Point(0,0), fs.Point(length, height), *self.mesh_size, diagonal="right")
+        return self._mesh
+
+    def create_function_spaces(self, type="P", degree=1):
+        """
+        create function spaces for both the vector valued space used in the problem and scalar valued space for post processing.
+        """
+        if self._function_space is None:
+            self._function_space = fs.VectorFunctionSpace(self.mesh, type, degree)
+        if self._post_scalar_field is None:
+            self._post_scalar_field = fs.FunctionSpace(self.mesh, type, degree)
+
+    def get_boundary_area(self):
+        """
+        Creates boundary area ds (fenics.MeshFunction) if not present and returns ds. It auto sets everything to 0.
+        """
+        if self._boundary_area is None:
+            mesh_dimensionality = self.mesh.topology().dim() - 1
+            self._boundary_area = fs.MeshFunction("size_t", self.mesh, mesh_dimensionality, 0)
+        return self._boundary_area
+
+    def _mark_end_faces(self, tol=1e-10):
+        """
+        Marks end faces from get_boundary_area() with fixed face (1) and load face (2).
+        returns the marked end faces which can be further specified with 1 or 2.
+        """
+        marking_areas = self.get_boundary_area()
+        marking_areas.set_all(0)
+        length = self.geometry_properties.length
+
+        class fixed_boundary(fs.SubDomain):
+            def inside(self, x, on_boundary):
+                return on_boundary and fs.near(x[0], 0.0, tol)
+            
+        class load_boundary(fs.SubDomain):
+            def inside(self, x, on_boundary):
+                return on_boundary and fs.near(x[0], length, tol)
+            
+        fixed_boundary().mark(marking_areas, 1)
+        load_boundary().mark(marking_areas, 2)
+
+        self._boundary_applied_areas = fs.Measure("ds", domain=self.mesh, subdomain_data=marking_areas)
+
+        return marking_areas
+
+    def _build_problem(self):
+        """
+        """
+        self.create_function_spaces()
+        marked_areas = self._mark_end_faces()
+
+        boundary_area = self._boundary_applied_areas
+
+        self._trial_function = fs.TrialFunction(self._function_space)
+        self._test_function = fs.TestFunction(self._function_space)
+        self._boundary_conditions = fs.DirichletBC(self._function_space, fs.Constant((0.0,0.0)), marked_areas, 1)
+
+        if self.loads.use_gravity:
+            body_forces = self.loads.body_forces(self.material_properties.density)
+        else:
+            body_forces = fs.Constant((0.0,0.0))
+        traction_forces = self.loads.traction_forces
+        
+        self._bilinear_lhs = fs.inner(self.stresses(self._trial_function), self.strains(self._test_function))*fs.dx
+        self._loading_rhs = fs.dot(body_forces, self._test_function)*fs.dx + fs.dot(traction_forces, self._test_function)*boundary_area(2)
+
+    def solve(self, solver_settings: Dict = {"linear_solver": "cg", "preconditioner": "hypre_amg"}, 
+              name="Displacement"):
+        """
+        Solve system by building the problem and using fenics.solve(a==L, u, bc, solver_properties).
+        solver_settings passes dict to solver_properties in fenics.solve()
+        returns displacement field u.
+        """
+        self._build_problem()
+        print('DOFs: %i'%self._function_space.dim())
+        self._displacement_field = fs.Function(self._function_space, name=name)
+        fs.solve(self._bilinear_lhs == self._loading_rhs,
+                 self._displacement_field,
+                 self._boundary_conditions,
+                 solver_parameters=solver_settings
+                 )
+        
+        return self._displacement_field
+
+    @property
+    def von_mises(self):
+        if self._von_mises is not None:
+            return self._von_mises
+        elif self._displacement_field is None or self._post_scalar_field is None:
+            raise RuntimeError("Please run solve() first before calculating displacement magnitudes")
+        else:   
+            sigma = self.stresses(self._displacement_field)
+            dimensions = self._displacement_field.geometric_dimension()
+            deviatoric_stress = sigma - (1.0/dimensions)*fs.tr(sigma)*fs.Identity(dimensions)
+            von_mises_stress = fs.sqrt(3.0/2*fs.inner(deviatoric_stress, deviatoric_stress))
+            self._von_mises = fs.project(von_mises_stress, self._post_scalar_field)
+            self._von_mises.rename("von Mises", "von Mises stress")
+            return self._von_mises
+    
+    @property
+    def displacement_magnitude(self):
+        if self._displacement_magnitude is not None:
+            return self._displacement_magnitude
+        elif self._displacement_field is None or self._post_scalar_field is None:
+            raise RuntimeError("Please run solve() first before calculating displacement magnitudes")
+        else:
+            displacement_magnitude = fs.sqrt(fs.dot(self._displacement_field, self._displacement_field))
+            self._displacement_magnitude = fs.project(displacement_magnitude, self._post_scalar_field)
+            self._displacement_magnitude.rename("magnitude", "displacement magnitude")
+            return self._displacement_magnitude
+    
+    @property
+    def euler_deflection(self):
+        force = self.loads.traction[1] * self.geometry_properties.section_area
+        length, area_moment = self.geometry_properties.length, self.geometry_properties.area_moment
+        e_modulus = self.material_properties.e_modulus
+        deflection = force*length**3/(3*e_modulus*area_moment)
+        if abs(deflection) > 0.01*length:
+            print(f"WARNING: large deformations detected! Vertical deformation is {abs(deflection)/length}%")
+        return deflection
+    
+    @property
+    def is_linear(self):
+        deflection = self.euler_deflection
+        if abs(deflection) > abs(0.01*self.geometry_properties.length):
+            return False
+        else:
+            return True
+    
+    def save_result(self):
+        """
+        Saves result to displacement, displacement_magnitude and von_mises.pvd using fenics.File().
+        returns tuple of bools (disp_save, mag_save, von_mises_save) with indicates if the saving was succesful.
+        """
+        displacement_save: bool = False
+        magnitude_save: bool = False
+        von_mises_save: bool = False
+        if self._displacement_field is not None:
+            displacement_save: bool = True
+            fs.File("elasticity_traction/displacement.pvd") << self._displacement_field 
+        if self._displacement_magnitude is not None:
+            magnitude_save: bool = True
+            fs.File("elasticity_traction/displacement_magnitude.pvd") << self._displacement_magnitude
+        if self._von_mises is not None:
+            von_mises_save: bool = True
+            fs.File("elasticity_traction/von_mises.pvd") << self._von_mises
+        return (displacement_save, magnitude_save, von_mises_save)
+    
+    def save_marked_areas(self):
+        """
+        Saves marked areas to boundary_area.pvd by using fenics.File() it returns a bool indicating succesful saving.
+        """
+        if self._boundary_area is not None:
+            fs.File("elasticity_traction/boundary_area.pvd") << self._boundary_area
+            return True
+        else:
+            print("Could not save boundary area as there is none. Mark area (solve) and try again")
+            return False
+        
+
+if __name__ == "__main__":
+    aluminum = material_properties_2d(e_modulus=71e9, poisson_ratio=0.33, density=2700.0)
+    PVC = material_properties_2d(e_modulus=3e9, poisson_ratio=0.33, density=1380.0)
+    beam_rectangle = geometry_properties_2d(height=0.02, width=0.01, length=10.0)
+    beam_rectangle_large = geometry_properties_2d(height=0.2, width=0.1, length=1.0)
+    load = load_case_2d(traction=(0.0, -5.0e7))
+
+    canti_beam_PVC = cantilever_beam_2d_linear(material_properties=PVC,
+                                               geometry_properties=beam_rectangle_large,
+                                               loads=load)
+    
+
+    canti_beam_aluminum = cantilever_beam_2d_linear(material_properties=aluminum,
+                                                    geometry_properties=beam_rectangle_large,
+                                                    loads=load, mesh_size=(1000,1000))
+    print(canti_beam_PVC.euler_deflection, canti_beam_aluminum.euler_deflection)
+    print(canti_beam_PVC.is_linear, canti_beam_aluminum.is_linear)
+    canti_beam_aluminum.solve()
+    canti_beam_PVC.solve()
+
+    res = canti_beam_aluminum.save_result()
+    print(res)
+    canti_beam_aluminum._mark_end_faces()
+    mark = canti_beam_aluminum.save_marked_areas()
+    print(mark)
