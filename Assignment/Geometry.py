@@ -6,7 +6,7 @@ import numpy as np
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class material_properties_2d:
+class MaterialProperties2d:
     """
         Dataclass containing the material properties for a 2D Fenics problem.
 
@@ -49,14 +49,14 @@ class material_properties_2d:
             raise ValueError(f"Shear modulus must be above 0. Shear modulus was {self.shear_modulus}.")
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class geometry_properties_2d:
+class GeometryProperties2d:
     """
     Dataclass containing the geometry properties for a 2D Fenics problem.
 
     Attributes:
         length:         [m]
         height:         [m]
-        width:          [m]
+        thickness:      [m]
     Properties:
         volume:         [m³]
         area_moment:    [m⁴]
@@ -66,27 +66,27 @@ class geometry_properties_2d:
     """
     length: float
     height: float
-    width: float
+    thickness: float
     
     @property
     def volume(self)->float:
-        return self.length*self.height*self.width
+        return self.length*self.height*self.thickness
     
     @property
     def area_moment(self):
-        return self.width*self.height**3/12
+        return self.thickness*self.height**3/12
     
     @property
     def section_area(self):
-        return self.height*self.width
+        return self.height*self.thickness
     
     def __post_init__(self): #This function checks for values being > 0.
         for attribute in fields(self):
             if getattr(self, attribute.name) <= 0:
                 raise ValueError(f"The attribute {str(attribute.name)} has negative values of {getattr(self, attribute.name)}")
 
-@dataclass(frozen=True, kw_only=True)
-class load_case_2d:
+@dataclass(frozen=True, slots=True, kw_only=True)
+class LoadCase2d:
     """
     Dataclass storing the load cases (traction and body forces) as fenics.Constant to be used in a beam class. 
     The coordinate directions x and y are positive right and up respectively.
@@ -149,11 +149,12 @@ class load_case_2d:
             print(f"The gravity direction is {self.gravity_dir} with magnitude {self.gravity_accel}")
 
 @dataclass(slots=True, kw_only=True)
-class cantilever_beam_2d_linear:
+class CantileverBeam2dLinear:
     """
     Dataclass that stores and calculates the standard cantilevered beam with left side fixed and right side load.
     fixed from (0.0,0.0) to (0.0, height) and load from (length,0.0) to (length, height).
-    use material and geometry classes to describe properties. 
+    use material and geometry classes to describe properties.
+    This class works for  
 
     Attributes:
         material_properties:    class like material_properties_2d
@@ -171,9 +172,9 @@ class cantilever_beam_2d_linear:
     Raises:
         RuntimeError: When von_mises or displacement_magnitude is run before solve()
     """
-    material_properties: material_properties_2d
-    geometry_properties: geometry_properties_2d
-    loads: load_case_2d
+    material_properties: MaterialProperties2d
+    geometry_properties: GeometryProperties2d
+    loads: LoadCase2d
     mesh_size: Optional[Tuple[int, int]] = None
 
     _mesh: Optional[Any] = field(default=None, init=False, repr=False)
@@ -218,7 +219,8 @@ class cantilever_beam_2d_linear:
         epsilon = self.strains(trial_function)
         shear_modulus = self.material_properties.shear_modulus
         dimensions = trial_function.geometric_dimension()
-        return self.material_properties.lame_lambda*fs.tr(epsilon)*fs.Identity(dimensions)+2*shear_modulus*epsilon
+        lame_lambda = self.material_properties.lame_lambda
+        return lame_lambda*fs.tr(epsilon)*fs.Identity(dimensions)+2*shear_modulus*epsilon
 
     @property
     def mesh(self):
@@ -274,24 +276,34 @@ class cantilever_beam_2d_linear:
 
     def _build_problem(self):
         """
+        Creates function spaces, marks end faces, applies boundary conditions and loads and sets up lhs and rhs of equation to solve.
+        It rewrites from cantilever_beam_2d_linear attribute naming to Søren's/fenics notation for the equations.
         """
         self.create_function_spaces()
         marked_areas = self._mark_end_faces()
 
-        boundary_area = self._boundary_applied_areas
 
         self._trial_function = fs.TrialFunction(self._function_space)
         self._test_function = fs.TestFunction(self._function_space)
         self._boundary_conditions = fs.DirichletBC(self._function_space, fs.Constant((0.0,0.0)), marked_areas, 1)
-
-        if self.loads.use_gravity:
-            body_forces = self.loads.body_forces(self.material_properties.density)
-        else:
-            body_forces = fs.Constant((0.0,0.0))
-        traction_forces = self.loads.traction_forces
         
-        self._bilinear_lhs = fs.inner(self.stresses(self._trial_function), self.strains(self._test_function))*fs.dx
-        self._loading_rhs = fs.dot(body_forces, self._test_function)*fs.dx + fs.dot(traction_forces, self._test_function)*boundary_area(2)
+        if self.loads.use_gravity:
+            F = self.loads.body_forces(self.material_properties.density)
+        else:
+            F = fs.Constant((0.0,0.0))
+
+        #Local variables that corresponds to Søren's/fenics notation style
+        u = self._trial_function
+        v = self._test_function
+        #bc = self._boundary_conditions #not used
+        T = self.loads.traction_forces
+        ds = self._boundary_applied_areas
+        sigma = self.stresses
+        epsilon = self.strains
+        t = self.geometry_properties.thickness
+
+        self._bilinear_lhs = t*fs.inner(sigma(u), epsilon(v))*fs.dx   #a in a==L
+        self._loading_rhs = t*fs.dot(F, v)*fs.dx + t*fs.dot(T, v)*ds(2) #L in a==L
 
     def solve(self, solver_settings: Dict = {"linear_solver": "cg", "preconditioner": "hypre_amg"}, 
               name="Displacement"):
@@ -388,18 +400,18 @@ class cantilever_beam_2d_linear:
         
 
 if __name__ == "__main__":
-    aluminum = material_properties_2d(e_modulus=71e9, poisson_ratio=0.33, density=2700.0)
-    PVC = material_properties_2d(e_modulus=3e9, poisson_ratio=0.33, density=1380.0)
-    beam_rectangle = geometry_properties_2d(height=0.02, width=0.01, length=10.0)
-    beam_rectangle_large = geometry_properties_2d(height=0.2, width=0.1, length=1.0)
-    load = load_case_2d(traction=(0.0, -5.0e7))
+    aluminum = MaterialProperties2d(e_modulus=71e9, poisson_ratio=0.33, density=2700.0)
+    PVC = MaterialProperties2d(e_modulus=3e9, poisson_ratio=0.33, density=1380.0)
+    beam_rectangle = GeometryProperties2d(height=0.02, thickness=0.01, length=10.0)
+    beam_rectangle_large = GeometryProperties2d(height=0.2, thickness=0.1, length=1.0)
+    load = LoadCase2d(traction=(0.0, -5.0e7))
 
-    canti_beam_PVC = cantilever_beam_2d_linear(material_properties=PVC,
+    canti_beam_PVC = CantileverBeam2dLinear(material_properties=PVC,
                                                geometry_properties=beam_rectangle_large,
                                                loads=load)
     
 
-    canti_beam_aluminum = cantilever_beam_2d_linear(material_properties=aluminum,
+    canti_beam_aluminum = CantileverBeam2dLinear(material_properties=aluminum,
                                                     geometry_properties=beam_rectangle_large,
                                                     loads=load, mesh_size=(1000,1000))
     print(canti_beam_PVC.euler_deflection, canti_beam_aluminum.euler_deflection)
