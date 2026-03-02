@@ -8,7 +8,7 @@ import numpy as np
 @dataclass(frozen=True, slots=True, kw_only=True)
 class MaterialProperties2d:
     """
-        Dataclass containing the material properties for a 2D Fenics problem.
+        Dataclass containing the material properties for a 2D fenics problem.
 
     Attributes:
         density:        Material density p  [kg/m³]
@@ -51,7 +51,7 @@ class MaterialProperties2d:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GeometryProperties2d:
     """
-    Dataclass containing the geometry properties for a 2D Fenics problem.
+    Dataclass containing the geometry properties for a 2D fenics problem.
 
     Attributes:
         length:         [m]
@@ -112,6 +112,12 @@ class LoadCase2d:
     traction: Optional[Tuple[float, float]] = None
     name: Optional[str] = None
 
+    def __post_init__(self): #This function handles not implemented general force and informs about gravity
+        if self.general_force is not None:
+            raise NotImplementedError("This has not yet been implemented")
+        if self.gravity_dir not in ((0.0, -1.0), None) or self.gravity_accel != 9.81:
+            print(f"The gravity direction is {self.gravity_dir} with magnitude {self.gravity_accel}")
+
     def body_forces(self, density: float):
         """
         Calculates body forces and returns fs.Constant object.
@@ -142,12 +148,6 @@ class LoadCase2d:
         else:
             raise ValueError("Traction not specified")
         
-    def __post_init__(self): #This function handles not implemented general force and informs about gravity
-        if self.general_force is not None:
-            raise NotImplementedError("This has not yet been implemented")
-        if self.gravity_dir != (0.0, -1.0) or self.gravity_accel != 9.81:
-            print(f"The gravity direction is {self.gravity_dir} with magnitude {self.gravity_accel}")
-
 @dataclass(slots=True, kw_only=True)
 class CantileverBeam2dLinear:
     """
@@ -183,18 +183,19 @@ class CantileverBeam2dLinear:
     _test_function: Optional[Any] = field(default=None, init=False, repr=False)
 
     _boundary_area: Optional[Any] = field(default=None, init=False, repr=False)
-    _external_load: Optional[Any] = field(default=None, init=False, repr=False)
+    #_external_load: Optional[Any] = field(default=None, init=False, repr=False)
     _boundary_conditions: Optional[Any] = field(default=None, init=False, repr=False)
     _boundary_applied_areas: Optional[Any] = field(default=False, init=False, repr=False)
 
     _displacement_field: Optional[Any] = field(default=None, init=False, repr=False)
     _bilinear_lhs: Optional[Any] = field(default=None, repr=False)
     _loading_rhs: Optional[Any] = field(default=None, repr=False)
-    _stress_field: Optional[Any] = field(default=None, init=False, repr=False)
+    #_stress_field: Optional[Any] = field(default=None, init=False, repr=False)
 
     _post_scalar_field: Optional[Any] = field(default=None, init=False, repr=False)
-    _displacement_magnitude: Optional[Any] = field(default=None, init=False, repr=False)
+    _strain_energy: Optional[Any] = field(default=None, init=False, repr=False)
     _von_mises: Optional[Any] = field(default=None, init=False, repr=False)
+    _displacement_magnitude: Optional[Any] = field(default=None, init=False, repr=False)
 
     def __post_init__(self): #Initializes mesh size to height/50 if it has not been set already.
         if self.mesh_size is None:
@@ -324,6 +325,18 @@ class CantileverBeam2dLinear:
         return self._displacement_field
 
     @property
+    def strain_energy(self):
+        if self._displacement_field is not None:
+            if self._strain_energy is None:
+                t = self.geometry_properties.thickness
+                u = self._displacement_field
+                pot_energy = 0.5*t*fs.inner(self.stresses(u), self.strains(u))*fs.dx
+                self._strain_energy = float(fs.assemble(pot_energy))
+            return self._strain_energy
+        else:
+            raise RuntimeError("run solve() before calculating strain energy")
+
+    @property
     def von_mises(self):
         if self._von_mises is not None:
             return self._von_mises
@@ -349,6 +362,13 @@ class CantileverBeam2dLinear:
             self._displacement_magnitude = fs.project(displacement_magnitude, self._post_scalar_field)
             self._displacement_magnitude.rename("magnitude", "displacement magnitude")
             return self._displacement_magnitude
+        
+    @property
+    def maximum_deflection(self):
+        if self._displacement_magnitude is not None:
+            return self._displacement_magnitude.vector().max()
+        else:
+            return self.displacement_magnitude.vector().max()
     
     @property
     def euler_deflection(self):
@@ -398,29 +418,27 @@ class CantileverBeam2dLinear:
             print("Could not save boundary area as there is none. Mark area (solve) and try again")
             return False
         
+def force_to_traction_2d(force:float, width:float, height:float)-> float:
+    """
+    Calculates the traction needed for a given section profile and force.
+    All inputs are in SI [N] | [m]
+    """
+    area = width*height
+    return force/area
 
 if __name__ == "__main__":
-    aluminum = MaterialProperties2d(e_modulus=71e9, poisson_ratio=0.33, density=2700.0)
+    #aluminum = MaterialProperties2d(e_modulus=71e9, poisson_ratio=0.33, density=2700.0)
     PVC = MaterialProperties2d(e_modulus=3e9, poisson_ratio=0.33, density=1380.0)
-    beam_rectangle = GeometryProperties2d(height=0.02, thickness=0.01, length=10.0)
-    beam_rectangle_large = GeometryProperties2d(height=0.2, thickness=0.1, length=1.0)
-    load = LoadCase2d(traction=(0.0, -5.0e7))
+    beam_rectangle_large = GeometryProperties2d(height=0.1, thickness=0.1, length=1.0)
+    load = LoadCase2d(traction=(0.0, -1.0e5))
 
-    canti_beam_PVC = CantileverBeam2dLinear(material_properties=PVC,
+    beam_PVC = CantileverBeam2dLinear(material_properties=PVC,
                                                geometry_properties=beam_rectangle_large,
                                                loads=load)
     
+    beam_PVC.solve()
+    beam_PVC.save_result()
+    beam_PVC.save_marked_areas()
+    print(beam_PVC.maximum_deflection)
+    print(force_to_traction_2d(-1000, 0.1, 0.1))
 
-    canti_beam_aluminum = CantileverBeam2dLinear(material_properties=aluminum,
-                                                    geometry_properties=beam_rectangle_large,
-                                                    loads=load, mesh_size=(1000,1000))
-    print(canti_beam_PVC.euler_deflection, canti_beam_aluminum.euler_deflection)
-    print(canti_beam_PVC.is_linear, canti_beam_aluminum.is_linear)
-    canti_beam_aluminum.solve()
-    canti_beam_PVC.solve()
-
-    res = canti_beam_aluminum.save_result()
-    print(res)
-    canti_beam_aluminum._mark_end_faces()
-    mark = canti_beam_aluminum.save_marked_areas()
-    print(mark)
