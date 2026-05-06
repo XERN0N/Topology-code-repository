@@ -9,19 +9,19 @@ class MaterialProperties2d:
         Dataclass containing the material properties for a 2D fenics problem.
 
     Attributes:
-        density:        Material density p  [kg/m³]
+        density:        Material density p  [kg/m³] (optional, set None if not needed)
         e_modulus:      Young's modulus     [Pa]
         poisson_ratio:  v                   [-]
     Properties:
-        shear_modulus:  µ                   [Pa] 
+        shear_modulus:  µ                   [Pa]
     Notes:
         µ calculated from poisson's ratio and E-modulus.
     Raises:
         ValueError: When inputs are negative or poisson ratio is outside (0,0.5].
     """
-    density: float
     e_modulus: float
     poisson_ratio: float
+    density: Optional[float] = None
     
     _shear_modulus: Optional[float] = field(default=None, init=False)
 
@@ -43,8 +43,10 @@ class MaterialProperties2d:
             raise ValueError("Youngs modulus cannot be <= 0")
         if self.poisson_ratio <= 0 or self.poisson_ratio > 0.5:
             raise ValueError(f"Poisson ratio cannot be {self.poisson_ratio} as it should be within 0 and 0.5")
-        if  self.shear_modulus <= 0:
+        if self.shear_modulus <= 0:
             raise ValueError(f"Shear modulus must be above 0. Shear modulus was {self.shear_modulus}.")
+        if self.density is not None and self.density <= 0:
+            raise ValueError(f"Density must be positive, got {self.density}.")
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GeometryProperties2d:

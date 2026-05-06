@@ -4,13 +4,13 @@
 #import "@preview/cetz:0.3.4": canvas, draw
 
 // ── drawing parameters — edit these to adjust the domain sketch ─────────────
-#let dom-L      = 5.0    // domain width  in cetz units  (= L = 1 m)
-#let dom-H      = 2.0    // domain height in cetz units  (= W = 0.5 m)
+#let dom-L      = 10.0    // domain width  in cetz units  (= L = 1 m)
+#let dom-H      = 1.5    // domain height in cetz units  (= W = 0.5 m)
 #let f1-pct     = 0.20   // F1 position along top edge as fraction of L
 #let f1-angle   = 65deg  // F1 angle from horizontal
 #let f2-angle   = 55deg  // F2 angle from horizontal (applied at tip, x=L)
-#let arr-len    = 0.88   // arrow shaft length in cetz units
-#let arc-r      = 0.32   // angle-arc radius
+#let arr-len    = 1.88   // arrow shaft length in cetz units
+#let arc-r      = 0.52   // angle-arc radius
 
 #set page(
   paper: "a3",
@@ -85,12 +85,12 @@ The bowsprit is modelled as a 2D *plane-strain* rectangular domain as shown belo
 
 #figure(
   grid(
-    columns: (1fr, 1.5fr),
+    columns: (1.5fr),
     gutter: 5pt,
     align: horizon,
-    rect(width: 100%, height: 56mm, fill: luma(235), stroke: 0.4pt)[
-      #align(center + horizon)[_Bowsprit installation photo —_\ _insert image here_]
-    ],
+    // rect(width: 100%, height: 56mm, fill: luma(235), stroke: 0.4pt)[
+    //   #align(center + horizon)[_Bowsprit installation photo —_\ _insert image here_]
+    // ],
     canvas(length: 0.87cm, {
       import draw: *
 
@@ -99,8 +99,8 @@ The bowsprit is modelled as a 2D *plane-strain* rectangular domain as shown belo
 
       // clamped left edge: thick bar + diagonal hatch marks
       line((0, 0), (0, dom-H), stroke: 2.5pt)
-      for i in range(8) {
-        let y = dom-H * i / 7
+      for i in range(6) {
+        let y = dom-H * i / 7 
         line((-0.38, y), (0.0, y + 0.32), stroke: 0.5pt)
       }
 
@@ -118,9 +118,9 @@ The bowsprit is modelled as a 2D *plane-strain* rectangular domain as shown belo
         (x1 - arr-len * calc.cos(f1-angle), dom-H + arr-len * calc.sin(f1-angle)),
         stroke: 1.3pt, mark: (end: ">"),
       )
-      arc((x1, dom-H), start: a1-dir, stop: 180deg, radius: arc-r, stroke: 0.5pt)
+      arc((x1, dom-H), start: a1-dir, stop: 180deg, radius: arc-r, anchor: "origin", stroke: 0.5pt)
 
-      let lbl-r  = arc-r + 0.25
+      let lbl-r  = arc-r + 0.35
       let a1-mid = (a1-dir + 180deg) / 2
       content(
         (x1 + lbl-r * calc.cos(a1-mid), dom-H + lbl-r * calc.sin(a1-mid)),
@@ -140,7 +140,7 @@ The bowsprit is modelled as a 2D *plane-strain* rectangular domain as shown belo
         (x2 - arr-len * calc.cos(f2-angle), dom-H + arr-len * calc.sin(f2-angle)),
         stroke: 1.3pt, mark: (end: ">"),
       )
-      arc((x2, dom-H), start: a2-dir, stop: 180deg, radius: arc-r, stroke: 0.5pt)
+      arc((x2, dom-H), start: a2-dir, stop: 180deg, radius: arc-r, anchor: "origin", stroke: 0.5pt)
 
       let a2-mid = (a2-dir + 180deg) / 2
       content(
@@ -219,8 +219,10 @@ If the three designs share the same load-path topology and differ only in member
 #section-head[Optimized design]
 
 #figure(
-  rect(width: 100%, height: 48mm, fill: luma(235), stroke: 0.4pt)[
-    #align(center + horizon)[_Optimized density field — add image_]
+  box(clip: true, width: 100%, height: 40mm)[
+    #move(dy: -40mm)[
+      #image("images/rho_bar_task3.png", width: 100%, height: 80mm)
+    ]
   ],
   caption: [Nominal optimized bowsprit topology ($eta_N = 0.5$). Blue = solid, white = void.],
 )
