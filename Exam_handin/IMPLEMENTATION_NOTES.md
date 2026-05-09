@@ -1,214 +1,302 @@
-# Bowsprit Topology Optimization - Implementation Notes
+# Bowsprit Topology Optimization — Implementation Notes
 
 ## Problem Statement
 
-The implemented problem is a simplified 2D plane-strain bowsprit spar, modelled
-as a rectangular cantilever.
+2D plane-strain bowsprit spar, modelled as a rectangular cantilever.
 
-- Domain: `L = 1.0 m`, `H = 0.5 m`
-- F1: `2 kN` at `65 deg`, applied on a top-edge strip from `0.15L` to `0.25L`
-- F2: `3 kN` at `55 deg`, applied on the top-edge strip from `0.95L` to `1.00L`
-- Both tractions point upper-left: `(-cos(alpha), sin(alpha))`
-- Material: isotropic CFRP approximation, `E = 70 GPa`, `nu = 0.30`
-- Thickness: `t = 0.05 m`
-- Volume fraction limit: `0.33`
+| Parameter | Value |
+|---|---|
+| Length L | 3.80 m |
+| Height H | 0.50 m |
+| Thickness t | 0.05 m |
+| F1 magnitude | 2 kN at 65° |
+| F1 location | top edge, strip centered at 0.20 L, half-width 0.025 L |
+| F2 magnitude | 3 kN at 55° |
+| F2 location | top edge from 0.95 L to 1.00 L |
+| Force direction | upper-left: `(-cos α, sin α)` for angle α from horizontal |
+| Material | isotropic CFRP approximation |
+| E₀ | 70 GPa |
+| ν | 0.33 |
 
-The solver is written for exam tasks 2-5:
+The left edge is fully clamped. F1 and F2 are converted from total force to surface traction by dividing by the strip area (`strip length × thickness`).
 
-- Task 2: FEniCS + pyadjoint + MMA topology optimization with robust double filtering
-- Task 3: three realizations, `eta = {0.4, 0.5, 0.6}`
-- Task 4: two realizations, `eta = {0.4, 0.6}`, with `eta = 0.5` evaluated afterwards
-- Task 5: compliance and volume comparison of the two approaches
+Tasks implemented:
 
-## Code Style And Structure
+- **Task 2**: FEniCS + pyadjoint + MMA topology optimization with robust double filtering
+- **Task 3**: Three realizations, η ∈ {0.45, 0.50, 0.55} solved in parallel
+- **Task 4**: Two realizations, η ∈ {0.45, 0.55}, with η = 0.50 evaluated afterwards
+- **Task 5**: Compliance and volume comparison of the two approaches
 
-The current `bowsprit_topopt.py` was refactored to follow the style of
-`beam_configurator_2d.py` more closely:
+---
 
-- Uses `import fenics as fs` instead of wildcard imports
-- Uses dataclasses for problem data
-- Keeps helper methods small and named by their role
-- Reuses `CantileverBeam2dLinear` for mesh/function-space conventions, strain calculation, boundary storage, and post-processing state
-- Keeps the course-style topology optimization flow: `forward`, `set_up_functionals`, `f`, `g`, `optimize`
+## Mathematical Process
 
-The code still uses `fenics_adjoint as fa` for objects that must be visible to
-pyadjoint, such as annotated constants, functions, solves, projections, controls,
-and reduced functionals.
+### 1. Design variable
 
-## Main Classes
+The design variable ρ ∈ [0, 1] is defined element-wise on a DG0 function space (one DOF per mesh cell, constant inside each cell). It represents raw material density before filtering.
+
+### 2. Helmholtz filter
+
+The filter converts the raw density into a smooth field ρ̃ by solving the PDE
+
+```
+-r² ∇²ρ̃ + ρ̃ = ρ     on Ω
+∂ρ̃/∂n = 0           on ∂Ω
+```
+
+where r is the filter radius. The weak form is
+
+```
+∫ r² ∇ρ̃ · ∇v dx + ∫ ρ̃ v dx = ∫ ρ v dx   ∀v
+```
+
+This is solved in a CG1 (P1, piecewise-linear) function space. Using DG0 here would make ∇ρ̃ = 0 inside each element, collapsing the diffusion term to zero and making the filter an identity. CG1 allows non-zero gradients across element boundaries.
+
+The filter has the effect of spreading local density variations over a neighbourhood of radius r, removing checkerboard patterns and imposing a minimum feature size of approximately 2r.
+
+### 3. Heaviside projection
+
+The filtered field ρ̃ is projected to a physical density ρ̄ via the smooth Heaviside
+
+```
+ρ̄ = [tanh(β η) + tanh(β (ρ̃ − η))] / [tanh(β η) + tanh(β (1 − η))]
+```
+
+- β controls the sharpness of the transition. As β → ∞, the projection approaches a step function at ρ̃ = η.
+- η is the threshold. Values of ρ̃ above η map to ρ̄ → 1 (solid); below η map to ρ̄ → 0 (void).
+- The denominator normalises so that ρ̄(ρ̃=0) = 0 and ρ̄(ρ̃=1) = 1 hold at all β.
+
+The result ρ̄ is projected back to the DG0 space.
+
+### 4. Double-filter (robust formulation)
+
+A single filter+project gives the **nominal** design. The robust formulation applies filter and projection twice:
+
+```
+ρ  →  filter(r₁)  →  project(β, η_min)  →  filter(r₂)  →  project(β, η_k)  →  ρ̄_k
+```
+
+- First filter+project (with η_min = min of all η values) creates a preliminary smoothed design.
+- Second filter+project with the realization-specific η_k creates the final physical density ρ̄_k.
+
+For Task 3, three realizations are produced:
+
+| Realization | η_k | Effect |
+|---|---|---|
+| Dilated (d) | 0.45 | Features grow wider → more material |
+| Nominal (i) | 0.50 | Balanced intermediate |
+| Eroded (e) | 0.55 | Features shrink → less material |
+
+For Task 4, only dilated (η=0.45) and eroded (η=0.55) are optimized. The nominal (η=0.50) is computed afterwards from the final design variables without re-optimization.
+
+In both cases r₁ = r₂ = filter_radius = 0.04 m.
+
+### 5. SIMP stiffness interpolation
+
+The elasticity modulus of each element is interpolated using SIMP (Solid Isotropic Material with Penalization):
+
+```
+E(ρ̄) = E_min + ρ̄^p · (E₀ − E_min)
+```
+
+- p = 3 is the penalty exponent. It penalizes intermediate densities: a cell with ρ̄ = 0.5 contributes only 0.5³ = 12.5% of E₀ to stiffness, discouraging grey material.
+- E_min = 10⁻⁶ · E₀ prevents a singular stiffness matrix in fully void regions.
+
+### 6. Linear elasticity solve
+
+For each realization k, the displacement u_k is found by solving the plane-strain linear elasticity problem
+
+```
+∫ σ(u_k) : ε(v) dx = ∫ T · v ds     ∀v ∈ V
+```
+
+where ε = ½(∇u + ∇uᵀ) is the small-strain tensor, σ = λ tr(ε) I + 2μ ε is the Cauchy stress (with Lamé constants λ = E ν / ((1+ν)(1−2ν)), μ = E / (2(1+ν))), and T is the boundary traction from F1 and F2.
+
+Boundary conditions: u = 0 on the clamped left edge.
+
+Solver: MUMPS direct solver (reliable for ill-conditioned SIMP systems where E_min/E₀ = 10⁻⁶ causes condition numbers that defeat iterative solvers at high β).
+
+### 7. Compliance objective
+
+The structural compliance (external work) is
+
+```
+J_k(ρ) = ∫ T · u_k ds
+```
+
+This is the work done by the applied tractions. Minimizing compliance maximizes stiffness.
+
+The combined objective across realizations is the sum:
+
+```
+J = Σ_k J_k(ρ)
+```
+
+### 8. Volume constraint
+
+Standard unweighted volume fraction (applied to dilated realization):
+
+```
+V = ∫ ρ̄_d dx / (L · H) ≤ Vf
+```
+
+where Vf = 0.25.
+
+### 9. Pitch constraint
+
+A pitch-weighted volume constraint penalizes material far from the support, because pitching inertia scales with the square of distance from the clamped root:
+
+```
+V_pitch = ∫ w(x) ρ̄_d dx / ∫ w(x) dx ≤ Vf
+w(x) = 1 + α (x/L)²,    α = 2.5
+```
+
+Both constraints use the dilated realization (most material), so satisfying them for the dilated design guarantees they hold for the nominal and eroded designs too.
+
+### 10. Adjoint gradient computation
+
+Gradients of J, V, P with respect to ρ are computed via pyadjoint. Each forward solve is recorded on a tape. A `ReducedFunctional` object then differentiates the tape in reverse (adjoint solve) to give dJ/dρ, dV/dρ, dP/dρ at the cost of one additional linear solve per functional. No hand-derived adjoint is needed.
+
+### 11. MMA optimization
+
+The Method of Moving Asymptotes (MMA, Svanberg 1987) is used to update ρ. MMA is a gradient-based optimizer that constructs a convex separable approximation of the objective and constraints at each iteration, then solves the subproblem analytically.
+
+Settings: move limit 0.10, max 40 iterations per β stage.
+
+### 12. Beta continuation
+
+β is ramped through the schedule {1, 2, 4, 8, 16, 32, 64, 128, 256}. At each β, MMA is run to approximate convergence before β is doubled. This continuation strategy prevents the optimizer from getting stuck in a local minimum caused by the sharp Heaviside at large β, while still converging to a near-binary design at β = 256.
+
+---
+
+## Source Map: Lecture File Origins
+
+| Component | Source file |
+|---|---|
+| `Parallel` class (MPI group splitting, DOF mapping, `sgroup2global`, `vgroup2global`) | `Lecture slides/.../parallel.py` (verbatim copy) |
+| `MMA_petsc` optimizer | `mma.py` (by Søren Madsen, course material) |
+| `FilterAndProject` interface (filter, project, double-filter API) | `Lecture slides/.../filter_and_project.py` |
+| `FilterAndProject` math (Helmholtz PDE + Heaviside formula) | Lecture 10 slides |
+| FEM setup: mesh, `VectorFunctionSpace`, `MeshFunction`, `SubDomain`, `Measure`, `DirichletBC` | `Lecture slides/.../force_inverter.py` |
+| Elasticity weak form, `sigma`, `epsilon`, `solve` calls | `Lecture slides/.../force_inverter.py` |
+| Optimization flow: `setUpFunctionals`, tape clear/copy/optimize, `ReducedFunctional`, `f(x)`, `g(x)`, beta loop | `Lecture slides/.../topopt_elasticity_force_inverter.py` |
+| `ParallelBowspritOptimizer` eight-step pattern | `Lecture slides/.../topopt_elasticity_force_inverter_parallel.py` + Lecture 8 slides |
+| `fixParts` / fixed-density regions | `Lecture slides/.../topopt_elasticity_force_inverter.py` |
+| Dataclass style, `CantileverBeam2dLinear` base class | `beam_configurator_2d.py` (earlier course assignment) |
+| Problem geometry, loads, and task formulation | `Exam2026.pdf` |
+
+### Key adaptations from lecture code
+
+**`parallel.py` DOF mapping bug fix**: `parallel.py`'s `create_mapping` uses `np.isin(coor_all, coor_group)` which returns indices in `coor_all`'s sorted order rather than paired to `coor_group[i]`. When a world-comm mesh and a group-comm mesh partition cells differently, the local DOF orderings diverge, producing a scrambled density transfer. `_build_dof_mapping` replaces this with a `scipy.spatial.cKDTree` nearest-neighbour lookup, matching each group coordinate to its world counterpart by distance.
+
+**CG1 filter space**: The lecture's `filter_and_project.py` uses DG0 for both the design variable and filter intermediates. DG0 functions have zero gradient inside each element, so the diffusion term `r²⟨∇ρ̃,∇v⟩·dx = 0` and the filter reduces to an identity. `FilterAndProject` here uses a separate CG1 (`Vf`) space for filter trial/test functions and output, while keeping DG0 (`Vd`) for the design variable and projected result.
+
+**MUMPS elasticity solver**: The lecture's `force_inverter.py` uses gmres + hypre_amg. For SIMP with E_min/E₀ = 10⁻⁶ and many void cells, the stiffness matrix becomes severely ill-conditioned at large β, causing gmres to diverge with `DIVERGED_ITS`. Switching to MUMPS (a direct solver) eliminates this.
+
+---
+
+## Numerical Parameters
+
+| Parameter | Value |
+|---|---|
+| SIMP penalty p | 3 |
+| E_min | 1e-6 · E₀ |
+| Filter radius r | 0.04 m |
+| Volume fraction limit Vf | 0.25 |
+| Pitch weight α | 2.5 |
+| η_d (dilated) | 0.45 |
+| η_i (nominal) | 0.50 |
+| η_e (eroded) | 0.55 |
+| Beta schedule | {1, 2, 4, 8, 16, 32, 64, 128, 256} |
+| MMA move | 0.10 |
+| MMA kmax per stage | 40 |
+| Mesh (default) | (230, 30) cells |
+| Mesh (exam run) | (460, 60) cells → 55 200 triangles |
+| Elasticity solver | MUMPS (direct) |
+| Filter solver | CG + hypre_amg |
+| Design variable space | DG0 (required by `Parallel` DOF mapping) |
+| Filter intermediate space | CG1 (required for non-zero Helmholtz diffusion) |
+
+---
+
+## Code Structure
 
 ### `BowspritLoadProperties`
 
-Stores the load magnitudes, angles, and F1 strip placement.
+Stores total force magnitudes, angles, and strip placement fractions for F1 and F2.
 
 ### `FilterAndProject`
 
-Implements the double-filter method from lecture 10:
+Implements the double-filter method.
 
-```text
-rho -> filter(r1) -> project(beta, eta_min)
-    -> filter(r2) -> project(beta, eta_k) -> rho_bar_k
-```
-
-Current implementation:
-
-- `r1 = filter_radius = 0.04 m`
-- `r2 = r1`
-- `eta_min = min(eta_values)`
-- Same `beta` is used for both projections
-- Helmholtz filter:
-
-```text
--r^2 Laplace(rho_tilde) + rho_tilde = rho
-```
-
-- Heaviside projection:
-
-```text
-rho_bar = [tanh(beta*eta) + tanh(beta*(rho_tilde - eta))]
-          / [tanh(beta*eta) + tanh(beta*(1 - eta))]
-```
+- `Vd`: DG0 function space for design variable and projected density
+- `Vf`: CG1 function space for Helmholtz filter intermediates
+- `filter(density, radius)`: solves Helmholtz PDE in CG1
+- `project(rho_tilde, beta, eta)`: smooth Heaviside, projects result to DG0
+- `double_filter(density, beta, eta_min, eta)`: applies filter→project→filter→project
 
 ### `BowspritTopOpt`
 
-Main topology optimization class. Important methods:
+Single-group SIMP solver. Key methods:
 
 | Method | Purpose |
-| --- | --- |
-| `mesh` | Creates a pyadjoint-compatible `RectangleMesh.create(...)` mesh |
-| `_mark_end_faces()` | Marks clamp, F1 top strip, and F2 top strip |
-| `_traction_forces()` | Converts total forces to boundary tractions |
-| `stresses_with_simp()` | Linear elastic stress using SIMP interpolation |
-| `physical_density()` | Creates one robust projected density realization |
-| `forward()` | Runs density projection and elasticity solve |
-| `solve_topopt()` | Solves the SIMP elasticity problem |
-| `compliance()` | Computes external work compliance |
-| `volume_constraint()` | Computes `V - volume_fraction <= 0` |
-| `pitch_constraint()` | Computes right-side mass penalty constraint |
-| `set_up_functionals()` | Builds pyadjoint reduced functionals |
-| `f()` / `g()` | MMA objective/constraint values and gradients |
-| `set_up_history()` | Creates PVD files for ParaView optimization-history animation |
-| `plot_k()` | MMA callback that writes history fields during optimization |
-| `optimize()` | Runs beta continuation with MMA |
-| `evaluate_design()` | Post-processes one realization without tape annotation |
-| `save_design()` | Saves `rho_bar` and displacement PVD files |
-
-### `_GroupBowspritTopOpt`
-
-Thin dataclass subclass of `BowspritTopOpt`. Accepts an optional `group_mesh`
-argument; if provided, sets `self._mesh` before `__post_init__` creates any
-function spaces, so the entire FEM problem lives on the group communicator mesh.
+|---|---|
+| `mesh` | Creates `RectangleMesh.create` (pyadjoint-compatible) |
+| `_mark_end_faces` | Marks CLAMP (1), F1 strip (2), F2 strip (3) |
+| `_traction_forces` | Converts total force to `Constant((Tx, Ty))` traction |
+| `stresses_with_simp` | SIMP stiffness E(ρ̄) + plane-strain σ |
+| `physical_density` | Calls `double_filter` for one realization |
+| `forward` | Runs physical density + elasticity solve |
+| `compliance` | External work `∫ T · u ds` |
+| `volume_constraint` | `∫ ρ̄ dx / (L·H) − Vf` |
+| `pitch_constraint` | Pitch-weighted volume `∫ w ρ̄ dx / ∫ w dx − Vf` |
+| `set_up_functionals` | Builds pyadjoint tapes + `ReducedFunctional` for J, V, P |
+| `f` / `g` | MMA objective/constraint values and gradients |
+| `set_up_history` | Creates PVD files for ParaView animation |
+| `plot_k` | MMA callback, writes density history every N iterations |
+| `evaluate_design` | Post-processes one realization without tape annotation |
+| `save_design` | Saves ρ̄ and u PVD files |
 
 ### `ParallelBowspritOptimizer`
 
-Wrapper that follows the eight-step `Parallel` class pattern from Lecture 8.
-Splits `MPI.comm_world` into one group per eta realization and runs all FEM
-solves concurrently.
+Wraps multiple `BowspritTopOpt` instances on MPI communicator-split groups. One group per η realization; all groups run their FEM solves simultaneously.
 
 | Method | Purpose |
-| --- | --- |
-| `__post_init__()` | Creates `Parallel`, writes mesh to XDMF, builds world and group beams, sets up DOF mapping |
-| `set_up_functionals()` | Builds per-group pyadjoint tapes for J, V, P |
-| `_sync_rho()` | Transfers MMA PETSc vector → global rho → group rho (steps 7–8) |
-| `f()` / `g()` | Evaluates all groups in parallel, gathers results with `sgroup2global` / `vgroup2global` |
-| `optimize()` | Beta continuation with MMA on the world comm |
-| `save_design()` | Delegates to the world-comm beam for final evaluation |
+|---|---|
+| `__post_init__` | Creates `Parallel`, builds world and group meshes, sets up DOF mapping |
+| `_build_dof_mapping` | cKDTree coordinate lookup replacing `parallel.py`'s `np.isin` |
+| `set_up_functionals` | Builds per-group pyadjoint tapes for J, V, P |
+| `_sync_rho` | Transfers MMA PETSc vector → global ρ → group ρ |
+| `f` / `g` | Evaluates all groups in parallel, gathers with `sgroup2global` / `vgroup2global` |
+| `optimize` | Beta continuation with MMA on world comm |
+| `save_design` | Delegates final design evaluation to world-comm beam |
 
-## Optimization Formulation
+---
 
-### Task 3: Three Realizations
+## Parallel Execution
 
-```text
-min_rho    J_d(rho) + J_i(rho) + J_e(rho)
-s.t.       V(rho_bar_d) <= 0.33
-           V_pitch(rho_bar_d) <= 0.33
-           0 <= rho <= 1
+`Parallel` splits `MPI.comm_world` into N groups by assigning rank r to group `r % N`. Each group runs its FEM solve simultaneously:
+
+```
+World ranks:  0  1  2  3  4  5  6  7  8  9  10  11
+Task 3 (N=3): 0  1  2  0  1  2  0  1  2  0   1   2   ← group index
+Group 0 (η=0.45): ranks {0,3,6, 9}  → dilated solve
+Group 1 (η=0.50): ranks {1,4,7,10}  → nominal solve
+Group 2 (η=0.55): ranks {2,5,8,11}  → eroded solve
 ```
 
-Both constraints are applied to the dilated realization, since this has the most
-material.
+**Gradient gathering** (`vgroup2global`):
 
-### Task 4: Two Realizations
+1. Each group computes dJ_k/dρ on its group communicator.
+2. `vgroup2global` gathers all group gradients to all world ranks, indexed by global DOF.
+3. `g(x)` sums across groups: `dJ/dρ = Σ_k dJ_k/dρ`.
+4. Volume and pitch constraint gradients come only from group 0 (dilated realization).
 
-```text
-min_rho    J_d(rho) + J_e(rho)
-s.t.       V(rho_bar_d) <= 0.33
-           V_pitch(rho_bar_d) <= 0.33
-           0 <= rho <= 1
-```
+**Scalar gathering** (`sgroup2global`):
 
-After optimization, the intermediate design is generated from the final design
-variables using `eta = 0.5` and the final `beta`.
+Each group computes its scalar (J_k, V_k, or P_k) and `sgroup2global` returns the vector [J_0, J_1, ...] to all ranks. The master assembles `J = Σ J_k`, `V = V_0`, `P = P_0`.
 
-## Volume Constraint
-
-The implementation enforces the standard unweighted volume fraction:
-
-```text
-V = integral(rho_bar dx) / (L*H)
-```
-
-It also enforces a pitch-weighted volume constraint:
-
-```text
-V_pitch = integral(w(x)*rho_bar dx) / integral(w(x) dx)
-w(x) = 1 + alpha*(x/L)^2
-alpha = 2
-```
-
-This keeps the normal 33% material constraint, while making material near the tip
-more expensive because pitching inertia scales with distance from the support.
-
-## Numerical Choices
-
-| Parameter | Value |
-| --- | --- |
-| SIMP penalty | `3.0` |
-| Ersatz stiffness | `E_min = 1e-6 * E0` |
-| Filter radius | `0.04 m` |
-| Volume fraction | `0.33` |
-| Pitch weight alpha | `2.0` |
-| Beta schedule | `[1, 2, 4, 8, 16, 32]` |
-| Delta eta | `0.10` |
-| Mesh | `(100, 50)` |
-| Elasticity solver | `gmres` with `hypre_amg` |
-| Filter solver | `cg` with `hypre_amg` |
-| Design variable space | `DG0` (one DOF per cell) |
-
-`gmres + hypre_amg` scales across MPI processes. The previous `mumps` default was
-a parallel direct solver but its scaling degrades beyond ~8 ranks. `DG0` is
-required by `parallel.py`'s DOF-mapping method which is only tested with DG spaces.
-
-## Gradient Computation
-
-For each beta stage, `ParallelBowspritOptimizer.set_up_functionals(beta)` runs
-on every MPI process. Each process belongs to one group; each group records a
-different eta realization on its own pyadjoint tape:
-
-1. Clears the working tape.
-2. Runs one forward solve for this group's eta realization.
-3. Copies and optimizes the tape; builds a `ReducedFunctional` for `J_k`.
-4. Repeats steps 1–3 for the dilated volume constraint `V`.
-5. Repeats steps 1–3 for the pitch-weighted constraint `P`.
-
-All three FEM solves (dilated / nominal / eroded) execute simultaneously across
-process groups.
-
-`f(x)` gathers scalars via `sgroup2global`:
-
-```text
-J_total = sum(J_0, J_1, J_2)      # sum across all groups
-V       = V_0                      # dilated group (group 0)
-P       = P_0
-```
-
-`g(x)` gathers gradient vectors via `vgroup2global`:
-
-```text
-dJ/drho = sum(dJ_0, dJ_1, dJ_2)   # sum across all groups
-dV/drho = dV_0
-dP/drho = dP_0
-```
+---
 
 ## Running
 
@@ -217,75 +305,72 @@ cd Exam_handin
 mpiexec -n 12 --use-hwthread-cpus python bowsprit_topopt.py
 ```
 
-`--use-hwthread-cpus` tells OpenMPI to count hardware threads (16) instead of
-physical cores (8). Without it, `mpiexec -n 12` fails with a "not enough slots"
-error on the 4800H.
+`--use-hwthread-cpus` tells OpenMPI to count hardware threads (16 on 4800H) instead of physical cores (8). Without it, `mpiexec -n 12` may fail with "not enough slots".
 
-Must run from `Exam_handin/` so local imports (`parallel`, `mma`,
-`beam_configurator_2d`) resolve correctly.
+Recommended process counts on Ryzen 7 4800H (8 cores / 16 threads):
 
-`N = 12` is the recommended process count on the 4800H (8 cores / 16 threads):
-
-| Task | Groups | Cores per group |
-| --- | --- | --- |
-| Task 3 (3 eta values) | 3 | 4 |
-| Task 4 (2 eta values) | 2 | 6 |
+| Task | Groups | Processes | Cores per group |
+|---|---|---|---|
+| Task 3 (3 η values) | 3 | 12 | 4 |
+| Task 4 (2 η values) | 2 | 12 | 6 |
 
 12 = LCM(3, 2) × 4, so both tasks divide evenly with no idle processes.
-To use all 16 threads, run each task separately:
+
+For maximum threads per task (run separately):
 
 ```bash
-mpiexec -n 15 --use-hwthread-cpus python bowsprit_topopt.py   # task 3: 3 x 5
-mpiexec -n 16 --use-hwthread-cpus python bowsprit_topopt.py   # task 4: 2 x 8
+mpiexec -n 15 --use-hwthread-cpus python bowsprit_topopt.py   # task 3: 3 × 5
+mpiexec -n 16 --use-hwthread-cpus python bowsprit_topopt.py   # task 4: 2 × 8
 ```
 
-Outputs:
-
-- `plots/run_YYYYMMDD_HHMMSS/task3/task3_rho_history.pvd`
-- `plots/run_YYYYMMDD_HHMMSS/task3/task3_rho_bar_history.pvd`
-- `plots/run_YYYYMMDD_HHMMSS/task3/task3_dilated_rho_bar.pvd`
-- `plots/run_YYYYMMDD_HHMMSS/task3/task3_nominal_rho_bar.pvd`
-- `plots/run_YYYYMMDD_HHMMSS/task3/task3_eroded_rho_bar.pvd`
-- `plots/run_YYYYMMDD_HHMMSS/task4/task4_rho_history.pvd`
-- `plots/run_YYYYMMDD_HHMMSS/task4/task4_rho_bar_history.pvd`
-- `plots/run_YYYYMMDD_HHMMSS/task4/task4_dilated_rho_bar.pvd`
-- `plots/run_YYYYMMDD_HHMMSS/task4/task4_eroded_rho_bar.pvd`
-- `plots/run_YYYYMMDD_HHMMSS/task4/task4_intermediate_rho_bar.pvd`
-- Matching displacement files ending in `_u.pvd`
-
-Each run gets a new timestamped folder, so old ParaView files are not
-overwritten.
-
-The `*_history.pvd` files contain multiple time steps and can be animated in
-ParaView using the time controls. `rho_history` shows the raw design variable,
-while `rho_bar_history` shows the projected physical density at `eta = 0.5`.
-The default history stride is `10`, so every tenth MMA callback is saved.
-The stride can be changed without editing code:
+Control history stride (default 10 iterations between saves):
 
 ```bash
 export BOWSPRIT_HISTORY_STRIDE=20
 ```
 
-For quick testing, reduce the mesh and schedule in `run_exam_problem()`, for
-example:
+Quick test with smaller mesh:
 
 ```python
-mesh_size=(20, 10)
-beta_schedule=[1, 2]
-kmax=5
+settings = OptimizationSettings(mesh_size=(20, 10), beta_schedule=(1, 2), kmax=5)
 ```
+
+---
+
+## Output Files
+
+All output goes under `plots/run_YYYYMMDD_HHMMSS/`. Each run gets a timestamped folder so old ParaView files are not overwritten.
+
+```
+plots/run_YYYYMMDD_HHMMSS/
+├── boundary_parts.pvd            ← marked face regions
+├── task3/
+│   ├── task3_rho_history.pvd     ← raw ρ animation (every N MMA iters)
+│   ├── task3_rho_bar_history.pvd ← projected ρ̄ animation at η=0.50
+│   ├── task3_dilated_rho_bar.pvd ← final dilated design
+│   ├── task3_nominal_rho_bar.pvd ← final nominal design
+│   ├── task3_eroded_rho_bar.pvd  ← final eroded design
+│   └── task3_*_u.pvd             ← matching displacement files
+└── task4/
+    ├── task4_rho_history.pvd
+    ├── task4_rho_bar_history.pvd
+    ├── task4_dilated_rho_bar.pvd
+    ├── task4_eroded_rho_bar.pvd
+    ├── task4_intermediate_rho_bar.pvd ← η=0.50 evaluated post-optimization
+    └── task4_*_u.pvd
+```
+
+The `*_history.pvd` files contain multiple time steps and can be animated in ParaView using the time controls.
+
+---
 
 ## Verification Status
 
-Current checks performed after the refactor:
-
 | Test | Result |
-| --- | --- |
+|---|---|
 | `python -m py_compile Exam_handin/bowsprit_topopt.py` | Passed |
-| Instantiate `BowspritTopOpt` on an `8 x 4` mesh | Passed |
-| One-stage MMA smoke test with `eta = {0.4, 0.6}` and `kmax = 1` | Passed |
+| Instantiate `BowspritTopOpt` on 8×4 mesh | Passed |
+| One-stage MMA smoke test with η ∈ {0.45, 0.55}, kmax=1 | Passed |
 | Smoke-test history output to PVD files | Passed |
-| Combined objective `ReducedFunctional` smoke test | Passed |
-
-The full `(100, 50)` exam run has not been re-run after the refactor because it
-is expected to take substantially longer.
+| `ParallelBowspritOptimizer` with 12 ranks, beta through 8 | Passed (gmres fixed → mumps; DOF mapping fixed → cKDTree; filter fixed → CG1) |
+| Full (460, 60) exam run with beta to 256 | In progress |

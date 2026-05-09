@@ -19,5 +19,8 @@
     <DataSet timestep="150" part="0" file="task3_rho_bar_history000015.pvtu" />
     <DataSet timestep="160" part="0" file="task3_rho_bar_history000016.pvtu" />
     <DataSet timestep="170" part="0" file="task3_rho_bar_history000017.pvtu" />
+    <DataSet timestep="180" part="0" file="task3_rho_bar_history000018.pvtu" />
+    <DataSet timestep="190" part="0" file="task3_rho_bar_history000019.pvtu" />
+    <DataSet timestep="200" part="0" file="task3_rho_bar_history000020.pvtu" />
   </Collection>
 </VTKFile>
