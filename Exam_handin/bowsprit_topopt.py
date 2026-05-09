@@ -8,7 +8,7 @@ tractions. The optimizer uses SIMP, double filtering, pyadjoint, and MMA.
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import fenics as fs
 import fenics_adjoint as fa
@@ -21,6 +21,8 @@ try:
 except ImportError:
     tqdm = None
 
+from fenics import MPI
+
 from beam_configurator_2d import (
     CantileverBeam2dLinear,
     GeometryProperties2d,
@@ -28,6 +30,12 @@ from beam_configurator_2d import (
     MaterialProperties2d,
 )
 from mma import MMA_petsc
+from parallel import Parallel
+
+
+CLAMP_MARKER = 1
+F1_MARKER = 2
+F2_MARKER = 3
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -43,7 +51,7 @@ class BowspritLoadProperties:
     f1_angle_deg: float = 65.0
     f2_angle_deg: float = 55.0
     f1_x_center_frac: float = 0.20
-    f1_strip_half_frac: float = 0.05
+    f1_strip_half_frac: float = 0.025
     f2_x_min_frac: float = 0.95
     f2_x_max_frac: float = 1.00
 
@@ -56,6 +64,35 @@ class BowspritLoadProperties:
             raise ValueError("The F1 load center must be inside the beam length.")
         if not 0.0 <= self.f2_x_min_frac < self.f2_x_max_frac <= 1.0:
             raise ValueError("The F2 load strip must satisfy 0 <= x_min < x_max <= 1.")
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizationSettings:
+    """
+    Tunable parameters for the exam optimization run.
+    """
+    mesh_size: Tuple[int, int] = (230, 30)
+    filter_radius: float = 0.03
+    volume_fraction: float = 0.25
+    pitch_weight_alpha: float = 2.5
+    beta_schedule: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+    kmax: int = 40
+    move: float = 0.1
+    eta_d: float = 0.45
+    eta_i: float = 0.5
+    eta_e: float = 0.55
+
+    @property
+    def eta3(self):
+        return [self.eta_d, self.eta_i, self.eta_e]
+
+    @property
+    def eta4(self):
+        return [self.eta_d, self.eta_e]
+
+    @property
+    def beta_final(self):
+        return self.beta_schedule[-1]
 
 
 @dataclass(kw_only=True)
@@ -75,7 +112,7 @@ class FilterAndProject:
     @property
     def Vd(self):
         if self._function_space is None:
-            self._function_space = fs.FunctionSpace(self.mesh, "P", 1)
+            self._function_space = fs.FunctionSpace(self.mesh, "DG", 0)
         return self._function_space
 
     @property
@@ -137,9 +174,11 @@ class BowspritTopOpt(CantileverBeam2dLinear):
     filter_radius: float = 0.04
     volume_fraction: float = 0.33
     pitch_weight_alpha: float = 2.0
-    elasticity_solver_settings: Dict = field(default_factory=lambda: {"linear_solver": "mumps"})
+    elasticity_solver_settings: Dict = field(default_factory=lambda: {
+        "linear_solver": "mumps",
+    })
     filter_solver_settings: Dict = field(default_factory=lambda: {
-        "linear_solver": "cg",
+        "linear_solver": "gmres",
         "preconditioner": "hypre_amg",
     })
 
@@ -151,6 +190,7 @@ class BowspritTopOpt(CantileverBeam2dLinear):
 
     _history_rho_file: Optional[Any] = field(default=None, init=False, repr=False)
     _history_rho_bar_file: Optional[Any] = field(default=None, init=False, repr=False)
+    _history_realization_files: Optional[Dict[float, Any]] = field(default=None, init=False, repr=False)
     _history_beta: Optional[float] = field(default=None, init=False, repr=False)
     _history_eta_values: Optional[List[float]] = field(default=None, init=False, repr=False)
     _history_eta: float = field(default=0.5, init=False, repr=False)
@@ -222,9 +262,9 @@ class BowspritTopOpt(CantileverBeam2dLinear):
                     and f2_x_min - tol <= x[0] <= f2_x_max + tol
                 )
 
-        fixed_boundary().mark(marking_areas, 1)
-        f1_boundary().mark(marking_areas, 2)
-        f2_boundary().mark(marking_areas, 3)
+        fixed_boundary().mark(marking_areas, CLAMP_MARKER)
+        f1_boundary().mark(marking_areas, F1_MARKER)
+        f2_boundary().mark(marking_areas, F2_MARKER)
 
         self._boundary_applied_areas = fs.Measure(
             "ds",
@@ -305,10 +345,10 @@ class BowspritTopOpt(CantileverBeam2dLinear):
             self._function_space,
             fa.Constant((0.0, 0.0)),
             self._boundary_area,
-            1,
+            CLAMP_MARKER,
         )
         a = thickness*fs.inner(self.stresses_with_simp(u, rho_bar), self.strains(v))*fs.dx
-        L = thickness*(fs.dot(T1, v)*ds(2) + fs.dot(T2, v)*ds(3))
+        L = thickness*(fs.dot(T1, v)*ds(F1_MARKER) + fs.dot(T2, v)*ds(F2_MARKER))
         displacement = fa.Function(self._function_space, name="Displacement")
 
         fa.solve(a == L,
@@ -325,16 +365,16 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         T1, T2 = self._traction_forces()
         thickness = self.geometry_properties.thickness
         ds = self._boundary_applied_areas
-        return fa.assemble(thickness*(fs.dot(T1, displacement)*ds(2) + fs.dot(T2, displacement)*ds(3)))
+        return fa.assemble(thickness*(fs.dot(T1, displacement)*ds(F1_MARKER) + fs.dot(T2, displacement)*ds(F2_MARKER)))
 
-    def volume(self, rho_bar):
+    def volume_fraction_of(self, rho_bar):
         """
         Calculates volume fraction.
         """
         area = self.geometry_properties.length*self.geometry_properties.height
         return fa.assemble(rho_bar*fs.dx)/area
 
-    def pitch_weighted_volume(self, rho_bar):
+    def pitch_weighted_volume_fraction_of(self, rho_bar):
         """
         Calculates weighted volume fraction for pitching-inertia penalty.
         """
@@ -350,13 +390,13 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         """
         Returns V - Vmax <= 0.
         """
-        return self.volume(rho_bar) - self.volume_fraction
+        return self.volume_fraction_of(rho_bar) - self.volume_fraction
 
     def pitch_constraint(self, rho_bar):
         """
         Returns pitch-weighted volume - Vmax <= 0.
         """
-        return self.pitch_weighted_volume(rho_bar) - self.volume_fraction
+        return self.pitch_weighted_volume_fraction_of(rho_bar) - self.volume_fraction
 
     def set_up_functionals(self, beta: float, eta_values: List[float]):
         """
@@ -413,7 +453,8 @@ class BowspritTopOpt(CantileverBeam2dLinear):
 
     def _set_density_from_petsc(self, x):
         rho_array = MMA_petsc.parToLocal(x)
-        self._rho.vector().set_local(rho_array)
+        lo, hi = self._rho.vector().local_range()
+        self._rho.vector().set_local(rho_array[lo:hi])
         self._rho.vector().apply("")
 
     def set_up_optimizer(self, x0, move: float, kmax: int):
@@ -431,13 +472,35 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         mma.kmin = 1
         return mma
 
-    def set_up_history(self, output_dir: str, prefix: str, stride: int):
+    @staticmethod
+    def eta_label(eta: float, eta_values: List[float]):
+        """
+        Gives a readable name to one robust density realization.
+        """
+        eta_min = min(eta_values)
+        eta_max = max(eta_values)
+        if np.isclose(eta, eta_min):
+            return "dilated"
+        if np.isclose(eta, eta_max):
+            return "eroded"
+        if np.isclose(eta, 0.5):
+            return "nominal"
+        return f"eta_{eta:.2f}".replace(".", "p")
+
+    def set_up_history(self, output_dir: str, prefix: str, stride: int, eta_values: List[float]):
         """
         Creates PVD files for ParaView animation.
         """
         os.makedirs(output_dir, exist_ok=True)
         self._history_rho_file = fs.File(os.path.join(output_dir, f"{prefix}_rho_history.pvd"))
         self._history_rho_bar_file = fs.File(os.path.join(output_dir, f"{prefix}_rho_bar_history.pvd"))
+        self._history_realization_files = {
+            eta: fs.File(os.path.join(
+                output_dir,
+                f"{prefix}_{self.eta_label(eta, eta_values)}_rho_bar_history.pvd",
+            ))
+            for eta in sorted(eta_values)
+        }
         self._history_stride = stride
         self._history_iteration = 0
 
@@ -464,6 +527,15 @@ class BowspritTopOpt(CantileverBeam2dLinear):
             )
             rho_bar.rename("rho_bar", "physical density")
             self._history_rho_bar_file << (rho_bar, self._history_iteration)
+
+            for eta, history_file in self._history_realization_files.items():
+                rho_bar_eta = self.physical_density(
+                    self._history_beta,
+                    self._history_eta_values,
+                    eta,
+                )
+                rho_bar_eta.rename("rho_bar", f"{self.eta_label(eta, self._history_eta_values)} density")
+                history_file << (rho_bar_eta, self._history_iteration)
         finally:
             fa.continue_annotation()
 
@@ -484,7 +556,7 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         mma = self.set_up_optimizer(rho_petsc, move, kmax_per_stage)
 
         if history_output_dir is not None:
-            self.set_up_history(history_output_dir, history_prefix, history_stride)
+            self.set_up_history(history_output_dir, history_prefix, history_stride, eta_values)
 
         rank = PETSc.COMM_WORLD.getRank()
         if rank == 0 and tqdm is not None:
@@ -518,7 +590,8 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         Evaluates one realization without recording on the pyadjoint tape.
         """
         if rho_array is not None:
-            self._rho.vector().set_local(rho_array)
+            lo, hi = self._rho.vector().local_range()
+            self._rho.vector().set_local(rho_array[lo:hi])
             self._rho.vector().apply("")
 
         fa.pause_annotation()
@@ -546,9 +619,272 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         fs.File(os.path.join(output_dir, f"{prefix}_u.pvd")) << displacement
         return (
             float(self.compliance(displacement)),
-            float(self.volume(rho_bar)),
-            float(self.pitch_weighted_volume(rho_bar)),
+            float(self.volume_fraction_of(rho_bar)),
+            float(self.pitch_weighted_volume_fraction_of(rho_bar)),
         )
+
+    def save_marked_faces(self, output_dir: str, prefix: str = "bowsprit"):
+        """
+        Saves boundary markers for manual inspection in ParaView.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        filename = os.path.join(output_dir, f"{prefix}_marked_faces.pvd")
+        fs.File(filename) << self._boundary_area
+        return filename
+
+
+@dataclass(kw_only=True)
+class _GroupBowspritTopOpt(BowspritTopOpt):
+    """BowspritTopOpt that accepts a pre-created mesh for use on a group communicator."""
+    group_mesh: Optional[Any] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        if self.group_mesh is not None:
+            self._mesh = self.group_mesh
+        super().__post_init__()
+
+
+@dataclass(kw_only=True)
+class ParallelBowspritOptimizer:
+    """
+    Runs one BowspritTopOpt per eta realization on separate MPI communicator groups
+    so all realizations solve their FEM simultaneously.
+
+    Follows the eight-step Parallel class pattern from Lecture 8.
+    Launch with: mpiexec -n N python bowsprit_topopt.py
+    Recommended N: divisible by len(eta_values).  For both tasks together use N=12
+    (task3: 3 groups x 4 cores, task4: 2 groups x 6 cores).
+    """
+    material_properties: MaterialProperties2d
+    geometry_properties: GeometryProperties2d
+    loads: LoadCase2d = field(default_factory=LoadCase2d)
+    bowsprit_loads: BowspritLoadProperties = field(default_factory=BowspritLoadProperties)
+    settings: OptimizationSettings = field(default_factory=OptimizationSettings)
+    eta_values: List[float] = field(default_factory=list)
+
+    _parallel: Optional[Any] = field(default=None, init=False, repr=False)
+    _beam_world: Optional[BowspritTopOpt] = field(default=None, init=False, repr=False)
+    _beam_group: Optional[_GroupBowspritTopOpt] = field(default=None, init=False, repr=False)
+    _rho_global: Optional[Any] = field(default=None, init=False, repr=False)
+    _Jhat_group: Optional[Any] = field(default=None, init=False, repr=False)
+    _Vhat_group: Optional[Any] = field(default=None, init=False, repr=False)
+    _Phat_group: Optional[Any] = field(default=None, init=False, repr=False)
+    _current_beta: float = field(default=1.0, init=False, repr=False)
+    _my_eta: float = field(default=0.5, init=False, repr=False)
+    _history_rho_file: Optional[Any] = field(default=None, init=False, repr=False)
+    _history_rho_bar_file: Optional[Any] = field(default=None, init=False, repr=False)
+    _history_stride: int = field(default=10, init=False, repr=False)
+    _history_iteration: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self):
+        ngroups = len(self.eta_values)
+        eta_sorted = sorted(self.eta_values)
+
+        # Step 3: split world communicator into ngroups groups
+        self._parallel = Parallel(MPI.comm_world, ngroups)
+        self._my_eta = eta_sorted[self._parallel.group]
+
+        kwargs = self._beam_kwargs()
+
+        # Step 1: world-comm beam for MMA rho space and final evaluation
+        self._beam_world = BowspritTopOpt(**kwargs)
+
+        # Step 2–5: group mesh created identically to BowspritTopOpt.mesh but on
+        # the group communicator.  RectangleMesh.create returns the Python
+        # dolfin.Mesh subclass that fenics_adjoint has overloaded; reading from
+        # XDMF returns the raw dolfin.cpp.mesh.Mesh binding and would cause an
+        # '_ad_will_add_as_dependency' AttributeError inside fa.solve.
+        length = self.geometry_properties.length
+        height = self.geometry_properties.height
+        nx, ny = self.settings.mesh_size
+        group_mesh = fs.RectangleMesh.create(
+            self._parallel.group_comm,
+            [fs.Point(0.0, 0.0), fs.Point(length, height)],
+            [nx, ny],
+            fs.CellType.Type.triangle,
+        )
+
+        self._beam_group = _GroupBowspritTopOpt(**kwargs, group_mesh=group_mesh)
+
+        # Step 4: global rho for MMA on world comm (DG0 to match group space)
+        Vd_global = fs.FunctionSpace(self._beam_world.mesh, "DG", 0)
+        self._rho_global = fa.interpolate(
+            fa.Constant(self.settings.volume_fraction),
+            Vd_global,
+        )
+        self._rho_global.rename("rho", "design variable")
+
+        # Step 6: DOF mapping between world and group function spaces
+        self._parallel.create_mapping(Vd_global, self._beam_group._filter_project.Vd)
+
+    def _beam_kwargs(self) -> Dict:
+        return dict(
+            material_properties=self.material_properties,
+            geometry_properties=self.geometry_properties,
+            loads=self.loads,
+            bowsprit_loads=self.bowsprit_loads,
+            mesh_size=self.settings.mesh_size,
+            verbose=False,
+            filter_radius=self.settings.filter_radius,
+            volume_fraction=self.settings.volume_fraction,
+            pitch_weight_alpha=self.settings.pitch_weight_alpha,
+        )
+
+    def set_up_functionals(self, beta: float):
+        """
+        Builds one ReducedFunctional per functional per group.
+        Each group records its own eta realization on a separate tape.
+        All groups record V and P using the dilated (min-eta) projection so
+        vgroup2global can gather from all groups and we use group-0's result.
+        """
+        control = fa.Control(self._beam_group._rho)
+        tape = fa.get_working_tape()
+
+        tape.clear_tape()
+        displacement, _ = self._beam_group.forward(beta, self.eta_values, self._my_eta)
+        J = self._beam_group.compliance(displacement)
+        J_tape = tape.copy()
+        J_tape.optimize(controls=[control], functionals=[J])
+        self._Jhat_group = fa.ReducedFunctional(J, control, tape=J_tape)
+
+        tape.clear_tape()
+        rho_bar_d = self._beam_group.physical_density(beta, self.eta_values, min(self.eta_values))
+        V = self._beam_group.volume_constraint(rho_bar_d)
+        V_tape = tape.copy()
+        V_tape.optimize(controls=[control], functionals=[V])
+        self._Vhat_group = fa.ReducedFunctional(V, control, tape=V_tape)
+
+        tape.clear_tape()
+        rho_bar_d2 = self._beam_group.physical_density(beta, self.eta_values, min(self.eta_values))
+        P = self._beam_group.pitch_constraint(rho_bar_d2)
+        P_tape = tape.copy()
+        P_tape.optimize(controls=[control], functionals=[P])
+        self._Phat_group = fa.ReducedFunctional(P, control, tape=P_tape)
+
+    def _sync_rho(self, x):
+        """Transfer MMA PETSc vector → global rho → group rho (steps 7–8)."""
+        rho_arr = MMA_petsc.parToLocal(x)
+        lo, hi = self._rho_global.vector().local_range()
+        self._rho_global.vector().set_local(rho_arr[lo:hi])
+        self._rho_global.vector().apply("")
+        self._parallel.fglobal2group(self._rho_global, self._beam_group._rho)
+
+    def f(self, x):
+        """
+        MMA function vector [objective, volume_constraint, pitch_constraint].
+        All groups evaluate in parallel; objective sums across groups,
+        constraints taken from group 0 (dilated realization).
+        """
+        self._sync_rho(x)
+        Ji = float(self._Jhat_group(self._beam_group._rho))
+        Vi = float(self._Vhat_group(self._beam_group._rho))
+        Pi = float(self._Phat_group(self._beam_group._rho))
+        Js = self._parallel.sgroup2global(Ji)
+        Vs = self._parallel.sgroup2global(Vi)
+        Ps = self._parallel.sgroup2global(Pi)
+        return np.array([float(np.sum(Js)), float(Vs[0]), float(Ps[0])])
+
+    def g(self, x):
+        """
+        MMA gradient matrix.
+        dJ sums gradients across all groups; dV and dP taken from group 0.
+        """
+        self._sync_rho(x)
+        dJs = self._parallel.vgroup2global(self._Jhat_group.derivative().vector())
+        dVs = self._parallel.vgroup2global(self._Vhat_group.derivative().vector())
+        dPs = self._parallel.vgroup2global(self._Phat_group.derivative().vector())
+        return np.array([np.sum(dJs, axis=0), dVs[0], dPs[0]])
+
+    def set_up_history(self, output_dir: str, prefix: str, stride: int):
+        os.makedirs(output_dir, exist_ok=True)
+        self._history_rho_file = fs.File(os.path.join(output_dir, f"{prefix}_rho_history.pvd"))
+        self._history_rho_bar_file = fs.File(os.path.join(output_dir, f"{prefix}_rho_bar_history.pvd"))
+        self._history_stride = stride
+        self._history_iteration = 0
+
+    def plot_k(self, x):
+        """MMA callback: write rho and nominal rho_bar to history files."""
+        if self._history_rho_file is None:
+            return
+        if self._history_iteration % self._history_stride != 0:
+            self._history_iteration += 1
+            return
+        rho_arr = MMA_petsc.parToLocal(x)
+        lo, hi = self._beam_world._rho.vector().local_range()
+        self._beam_world._rho.vector().set_local(rho_arr[lo:hi])
+        self._beam_world._rho.vector().apply("")
+        self._beam_world._rho.rename("rho", "design variable")
+        self._history_rho_file << (self._beam_world._rho, self._history_iteration)
+        fa.pause_annotation()
+        try:
+            rho_bar = self._beam_world.physical_density(
+                self._current_beta, self.eta_values, 0.5,
+            )
+            rho_bar.rename("rho_bar", "physical density")
+            self._history_rho_bar_file << (rho_bar, self._history_iteration)
+        finally:
+            fa.continue_annotation()
+        self._history_iteration += 1
+
+    def optimize(self,
+                 beta_schedule: List[float],
+                 kmax_per_stage: int,
+                 move: float,
+                 history_output_dir: Optional[str] = None,
+                 history_prefix: str = "history",
+                 history_stride: int = 10):
+        """Runs beta-continuation topology optimization across parallel realization groups."""
+        rho_petsc = fa.as_backend_type(self._rho_global.vector()).vec()
+        mma = MMA_petsc(rho_petsc, 2, f=self.f, g=self.g, plot_k=self.plot_k)
+        mma.xmin[:] = 0.0
+        mma.xmax[:] = 1.0
+        mma.move = move
+        mma.xtol = 1e-4
+        mma.ftol = 1e-5
+        mma.lmax = 5
+        mma.kmax = kmax_per_stage
+        mma.kmin = 1
+
+        if history_output_dir is not None:
+            self.set_up_history(history_output_dir, history_prefix, history_stride)
+
+        rank = PETSc.COMM_WORLD.getRank()
+        if rank == 0 and tqdm is not None:
+            beta_iterator = tqdm(
+                beta_schedule,
+                desc=f"{history_prefix} beta stages",
+                unit="stage",
+            )
+        else:
+            beta_iterator = beta_schedule
+
+        for beta in beta_iterator:
+            if rank == 0 and tqdm is not None:
+                beta_iterator.set_postfix(beta=beta, eta=self._my_eta)
+            elif rank == 0:
+                print("beta=", beta, "group eta=", self._my_eta)
+            self._current_beta = beta
+            self.set_up_functionals(beta)
+            mma.solve(rho_petsc)
+
+        rho_arr = MMA_petsc.parToLocal(mma.x)
+        lo, hi = self._rho_global.vector().local_range()
+        self._rho_global.vector().set_local(rho_arr[lo:hi])
+        self._rho_global.vector().apply("")
+        return rho_arr
+
+    def save_design(self,
+                    beta: float,
+                    eta_values: List[float],
+                    eta: float,
+                    prefix: str,
+                    output_dir: str,
+                    rho_array: Optional[np.ndarray] = None):
+        """Delegates final design evaluation to the world-comm beam."""
+        return self._beam_world.save_design(beta, eta_values, eta, prefix, output_dir, rho_array)
+
+    def save_marked_faces(self, output_dir: str, prefix: str = "bowsprit"):
+        return self._beam_world.save_marked_faces(output_dir, prefix)
 
 
 def make_run_directory(base_dir="plots"):
@@ -561,20 +897,23 @@ def make_run_directory(base_dir="plots"):
     return output_dir
 
 
-def create_beam(material, geometry, loads, mesh_size, filter_radius, pitch_weight_alpha):
+def make_bowsprit(material, geometry, loads, settings: OptimizationSettings):
+    """
+    Creates a bowsprit optimizer from the shared run settings.
+    """
     return BowspritTopOpt(
         material_properties=material,
         geometry_properties=geometry,
         loads=loads,
-        mesh_size=mesh_size,
+        mesh_size=settings.mesh_size,
         verbose=False,
-        filter_radius=filter_radius,
-        volume_fraction=0.25,
-        pitch_weight_alpha=pitch_weight_alpha,
+        filter_radius=settings.filter_radius,
+        volume_fraction=settings.volume_fraction,
+        pitch_weight_alpha=settings.pitch_weight_alpha,
     )
 
 
-def save_realizations(beam, beta, eta_values, rho_array, task_name, labels, output_root):
+def save_final_realizations(beam, beta, eta_values, rho_array, task_name, labels, output_root):
     results = {}
     output_dir = os.path.join(output_root, task_name)
     for eta, label in labels.items():
@@ -618,97 +957,84 @@ def print_comparison(results3, results4):
     print(f"\nIntermediate comparison difference: {difference:+.2f} %")
 
 
-def run_exam_problem():
+if __name__ == "__main__":
+    # Run with: mpiexec -n 12 python bowsprit_topopt.py
+    # 12 processes: task3 uses 3 groups x 4 cores, task4 uses 2 groups x 6 cores.
     fs.set_log_level(30)
 
-    material = MaterialProperties2d(e_modulus=70e9, poisson_ratio=0.30, density=None)
+    material = MaterialProperties2d(e_modulus=70e9, poisson_ratio=0.33, density=None)
     geometry = GeometryProperties2d(length=3.80, height=0.5, thickness=0.05)
     loads = LoadCase2d()
-
-    mesh_size = (230,30)#(460, 60)
-    filter_radius = 0.03
-
-    pitch_weight_alpha = 2.0
-    beta_schedule = [2**i for i in range(9)]
-    beta_final = beta_schedule[-1]
-    kmax = 15
+    settings = OptimizationSettings(mesh_size=(460, 60))
     history_stride = int(os.environ.get("BOWSPRIT_HISTORY_STRIDE", "10"))
     output_root = make_run_directory("plots")
-
-    eta_d = 0.45
-    eta_i = 0.5
-    eta_e = 0.55
 
     if PETSc.COMM_WORLD.getRank() == 0:
         print("Bowsprit topology optimization")
         print("Output:", output_root)
 
-    beam3 = create_beam(
-        material,
-        geometry,
-        loads,
-        mesh_size,
-        filter_radius,
-        pitch_weight_alpha,
+    # Task 3: optimize using dilated, nominal, and eroded realizations in parallel.
+    opt3 = ParallelBowspritOptimizer(
+        material_properties=material,
+        geometry_properties=geometry,
+        loads=loads,
+        settings=settings,
+        eta_values=list(settings.eta3),
     )
-    eta3 = [eta_d, eta_i, eta_e]
-    rho3 = beam3.optimize(
-        eta_values=eta3,
-        beta_schedule=beta_schedule,
-        kmax_per_stage=kmax,
-        move=0.3,
+    marker_file = opt3.save_marked_faces(output_root)
+    if PETSc.COMM_WORLD.getRank() == 0:
+        print("Marked faces:", marker_file)
+
+    rho3 = opt3.optimize(
+        beta_schedule=settings.beta_schedule,
+        kmax_per_stage=settings.kmax,
+        move=settings.move,
         history_output_dir=os.path.join(output_root, "task3"),
         history_prefix="task3",
         history_stride=history_stride,
     )
-    results3 = save_realizations(
-        beam3,
-        beta_final,
-        eta3,
+    results3 = save_final_realizations(
+        opt3,
+        settings.beta_final,
+        settings.eta3,
         rho3,
         "task3",
-        {eta_d: "dilated", eta_i: "nominal", eta_e: "eroded"},
+        {settings.eta_d: "dilated", settings.eta_i: "nominal", settings.eta_e: "eroded"},
         output_root,
     )
 
-    beam4 = create_beam(
-        material,
-        geometry,
-        loads,
-        mesh_size,
-        filter_radius,
-        pitch_weight_alpha,
+    # Task 4: optimize using dilated and eroded realizations in parallel.
+    opt4 = ParallelBowspritOptimizer(
+        material_properties=material,
+        geometry_properties=geometry,
+        loads=loads,
+        settings=settings,
+        eta_values=list(settings.eta4),
     )
-    eta4 = [eta_d, eta_e]
-    rho4 = beam4.optimize(
-        eta_values=eta4,
-        beta_schedule=beta_schedule,
-        kmax_per_stage=kmax,
-        move=0.2,
+    rho4 = opt4.optimize(
+        beta_schedule=settings.beta_schedule,
+        kmax_per_stage=settings.kmax,
+        move=settings.move,
         history_output_dir=os.path.join(output_root, "task4"),
         history_prefix="task4",
         history_stride=history_stride,
     )
-    results4 = save_realizations(
-        beam4,
-        beta_final,
-        eta4,
+    results4 = save_final_realizations(
+        opt4,
+        settings.beta_final,
+        settings.eta4,
         rho4,
         "task4",
-        {eta_d: "dilated", eta_e: "eroded"},
+        {settings.eta_d: "dilated", settings.eta_e: "eroded"},
         output_root,
     )
-    results4["intermediate"] = beam4.save_design(
-        beta_final,
-        eta4,
-        eta_i,
+    results4["intermediate"] = opt4.save_design(
+        settings.beta_final,
+        settings.eta4,
+        settings.eta_i,
         "task4_intermediate",
         os.path.join(output_root, "task4"),
         rho4,
     )
 
     print_comparison(results3, results4)
-
-
-if __name__ == "__main__":
-    run_exam_problem()

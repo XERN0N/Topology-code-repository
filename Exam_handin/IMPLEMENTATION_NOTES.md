@@ -6,7 +6,6 @@ The implemented problem is a simplified 2D plane-strain bowsprit spar, modelled
 as a rectangular cantilever.
 
 - Domain: `L = 1.0 m`, `H = 0.5 m`
-- Left edge: fully clamped
 - F1: `2 kN` at `65 deg`, applied on a top-edge strip from `0.15L` to `0.25L`
 - F2: `3 kN` at `55 deg`, applied on the top-edge strip from `0.95L` to `1.00L`
 - Both tractions point upper-left: `(-cos(alpha), sin(alpha))`
@@ -94,6 +93,27 @@ Main topology optimization class. Important methods:
 | `evaluate_design()` | Post-processes one realization without tape annotation |
 | `save_design()` | Saves `rho_bar` and displacement PVD files |
 
+### `_GroupBowspritTopOpt`
+
+Thin dataclass subclass of `BowspritTopOpt`. Accepts an optional `group_mesh`
+argument; if provided, sets `self._mesh` before `__post_init__` creates any
+function spaces, so the entire FEM problem lives on the group communicator mesh.
+
+### `ParallelBowspritOptimizer`
+
+Wrapper that follows the eight-step `Parallel` class pattern from Lecture 8.
+Splits `MPI.comm_world` into one group per eta realization and runs all FEM
+solves concurrently.
+
+| Method | Purpose |
+| --- | --- |
+| `__post_init__()` | Creates `Parallel`, writes mesh to XDMF, builds world and group beams, sets up DOF mapping |
+| `set_up_functionals()` | Builds per-group pyadjoint tapes for J, V, P |
+| `_sync_rho()` | Transfers MMA PETSc vector → global rho → group rho (steps 7–8) |
+| `f()` / `g()` | Evaluates all groups in parallel, gathers results with `sgroup2global` / `vgroup2global` |
+| `optimize()` | Beta continuation with MMA on the world comm |
+| `save_design()` | Delegates to the world-comm beam for final evaluation |
+
 ## Optimization Formulation
 
 ### Task 3: Three Realizations
@@ -151,44 +171,72 @@ more expensive because pitching inertia scales with distance from the support.
 | Beta schedule | `[1, 2, 4, 8, 16, 32]` |
 | Delta eta | `0.10` |
 | Mesh | `(100, 50)` |
-| Elasticity solver | `mumps` |
+| Elasticity solver | `gmres` with `hypre_amg` |
 | Filter solver | `cg` with `hypre_amg` |
+| Design variable space | `DG0` (one DOF per cell) |
 
-The previous version used `E_min = 1e-9 * E0` and iterative CG/HYPRE for
-elasticity. That combination caused PETSc to fail around `beta = 16` with
-`DIVERGED_INDEFINITE_MAT`. The current default is more conservative:
-
-- Larger `E_min` reduces stiffness contrast.
-- Direct `mumps` solve is more robust for the high-contrast elasticity system.
-- Beta continuation stops at `32`, which is usually crisp enough for the exam comparison.
+`gmres + hypre_amg` scales across MPI processes. The previous `mumps` default was
+a parallel direct solver but its scaling degrades beyond ~8 ranks. `DG0` is
+required by `parallel.py`'s DOF-mapping method which is only tested with DG spaces.
 
 ## Gradient Computation
 
-For each beta stage, `set_up_functionals(beta, eta_values)`:
+For each beta stage, `ParallelBowspritOptimizer.set_up_functionals(beta)` runs
+on every MPI process. Each process belongs to one group; each group records a
+different eta realization on its own pyadjoint tape:
 
-1. Clears the working pyadjoint tape.
-2. Runs one forward solve for each robust realization on one objective tape.
-3. Builds one combined compliance `ReducedFunctional` for `sum(J_k)`.
-4. Builds a separate `ReducedFunctional` for the dilated volume constraint.
-5. Builds a separate `ReducedFunctional` for the pitch-weighted constraint.
+1. Clears the working tape.
+2. Runs one forward solve for this group's eta realization.
+3. Copies and optimizes the tape; builds a `ReducedFunctional` for `J_k`.
+4. Repeats steps 1–3 for the dilated volume constraint `V`.
+5. Repeats steps 1–3 for the pitch-weighted constraint `P`.
 
-MMA receives:
+All three FEM solves (dilated / nominal / eroded) execute simultaneously across
+process groups.
+
+`f(x)` gathers scalars via `sgroup2global`:
 
 ```text
-[sum(J_k), V_constraint, V_pitch_constraint]
+J_total = sum(J_0, J_1, J_2)      # sum across all groups
+V       = V_0                      # dilated group (group 0)
+P       = P_0
 ```
 
-and the corresponding gradients:
+`g(x)` gathers gradient vectors via `vgroup2global`:
 
 ```text
-[d(sum(J_k))/d rho, dV/d rho, dV_pitch/d rho]
+dJ/drho = sum(dJ_0, dJ_1, dJ_2)   # sum across all groups
+dV/drho = dV_0
+dP/drho = dP_0
 ```
 
 ## Running
 
 ```bash
 cd Exam_handin
-python bowsprit_topopt.py
+mpiexec -n 12 --use-hwthread-cpus python bowsprit_topopt.py
+```
+
+`--use-hwthread-cpus` tells OpenMPI to count hardware threads (16) instead of
+physical cores (8). Without it, `mpiexec -n 12` fails with a "not enough slots"
+error on the 4800H.
+
+Must run from `Exam_handin/` so local imports (`parallel`, `mma`,
+`beam_configurator_2d`) resolve correctly.
+
+`N = 12` is the recommended process count on the 4800H (8 cores / 16 threads):
+
+| Task | Groups | Cores per group |
+| --- | --- | --- |
+| Task 3 (3 eta values) | 3 | 4 |
+| Task 4 (2 eta values) | 2 | 6 |
+
+12 = LCM(3, 2) × 4, so both tasks divide evenly with no idle processes.
+To use all 16 threads, run each task separately:
+
+```bash
+mpiexec -n 15 --use-hwthread-cpus python bowsprit_topopt.py   # task 3: 3 x 5
+mpiexec -n 16 --use-hwthread-cpus python bowsprit_topopt.py   # task 4: 2 x 8
 ```
 
 Outputs:
