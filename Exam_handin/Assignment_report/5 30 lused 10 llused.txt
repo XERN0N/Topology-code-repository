@@ -1,0 +1,37 @@
+   5/  30 : lused= 10 : llused=   18 f0(x)=17.2493 max(f)=-0.0000 i= 1 max(y)=0.0000 z=0.0000 xchg=0.000000 fchg=0.000026 max(x)=1.000  min(x)=0.000
+   6/  30 : lused= 10 : llused=   18 f0(x)=17.2493 max(f)=-0.0000 i= 1 max(y)=0.0000 z=0.0000 xchg=0.000000 fchg=0.000029 max(x)=1.000  min(x)=0.000
+   7/  30 : lused= 10 : llused=   19 f0(x)=17.2493 max(f)=-0.0000 i= 1 max(y)=0.0000 z=0.0000 xchg=0.000000 fchg=0.000051 max(x)=1.000  min(x)=0.000
+   8/  30 : lused= 10 : llused=   19 f0(x)=17.2493 max(f)=0.0000 i= 1 max(y)=0.0000 z=0.0000 xchg=0.000000 fchg=0.000064 max(x)=1.000  min(x)=0.000
+   9/  30 : lused= 10 : llused=   19 f0(x)=17.2493 max(f)=-0.0000 i= 1 max(y)=0.0000 z=0.0000 xchg=0.000000 fchg=0.000088 max(x)=1.000  min(x)=0.000
+  10/  30 : lused= 10 : llused=   18 f0(x)=17.2493 max(f)=-0.0000 i= 1 max(y)=0.0000 z=0.0000 xchg=0.000000 fchg=0.000062 max(x)=1.000  min(x)=0.000
+  11/  30 : lused= 10 : llused=   19 f0(x)=17.2493 max(f)=0.0000 i= 1 max(y)=0.0000 z=0.0000 xchg=0.000001 fchg=0.000190 max(x)=1.000  min(x)=0.000
+  12/  30 : lused= 11 : llused=   11 f0(x)=17.2493 max(f)=-0.0000 i= 1 max(y)=0.0000 z=0.0000 xchg=0.000001 fchg=0.000319 max(x)=1.000  min(x)=0.000
+  13/  30 : lused= 11 : llused=   18 f0(x)=17.2493 max(f)=0.0000 i= 1 max(y)=0.0000 z=0.0000 xchg=0.000000 fchg=0.000010 max(x)=1.000  min(x)=0.000
+task4 beta stages: 100%|██████████| 15/15 [7:58:52<00:00, 1915.51s/stage, beta=432, eta=0.45, p=400]  
+task4 dilated: J = 7.9844e+00, V = 0.250, V_pitch = 0.217, σ_max = 21.7 MPa
+task4 eroded: J = 9.2649e+00, V = 0.198, V_pitch = 0.166, σ_max = 24.5 MPa
+
+Design comparison
+Design                              J        V    V_pitch    σ_max [MPa]
+--------------------------------------------------------------------------
+3-design dilated        8.0443e+00    0.250      0.219           18.3
+3-design nominal        8.5577e+00    0.226      0.195           19.5
+3-design eroded         9.4318e+00    0.196      0.165           20.9
+2-design dilated        7.9844e+00    0.250      0.217           21.7
+2-design intermediate   8.5348e+00    0.227      0.195           23.0
+2-design eroded         9.2649e+00    0.198      0.166           24.5
+
+Intermediate comparison difference: -0.27 %
+
+Constraint diagnostic  (V_f=0.250, σ_y=40MPa)
+----------------------------------------------------------------------------------------------------
+  task3 dilated           vol:binding  pitch:slack(0.219)  stress:slack(σ_max=18.3MPa)
+  task3 nominal           vol:slack(0.226)  pitch:slack(0.195)  stress:slack(σ_max=19.5MPa)
+  task3 eroded            vol:slack(0.196)  pitch:slack(0.165)  stress:slack(σ_max=20.9MPa)
+  task4 dilated           vol:binding  pitch:slack(0.217)  stress:slack(σ_max=21.7MPa)
+  task4 eroded            vol:slack(0.198)  pitch:slack(0.166)  stress:slack(σ_max=24.5MPa)
+  task4 intermediate      vol:slack(0.227)  pitch:slack(0.195)  stress:slack(σ_max=23.0MPa)
+
+real    660m51.169s
+user    2096m56.488s
+sys     46m33.866s
