@@ -1,8 +1,16 @@
 """
-Topology optimization of a simplified bowsprit beam for the 2026 exam.
+Topology optimization of a bowsprit beam (2D, linear-elastic cantilever).
 
-The model is a 2D linear-elastic cantilever with two angled top-surface
-tractions. The optimizer uses SIMP, double filtering, pyadjoint, and MMA.
+Two angled surface tractions on the top face. Uses SIMP density interpolation,
+double-filter robust formulation (Lecture 10), pyadjoint adjoint sensitivities,
+and MMA. Supports serial and MPI-parallel modes — one realization group per eta value.
+
+Compliance objective J = ∫ T·u ds (external work, equals strain energy for
+linear elasticity).
+
+_build_dof_mapping replaces parallel.py:create_mapping, which pairs DOFs by
+np.isin position rather than by coordinate and scrambles the mapping when the
+two communicators partition cells differently.
 """
 
 import os
@@ -11,18 +19,17 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import fenics as fs
+from fenics import MPI
 import fenics_adjoint as fa
 import numpy as np
 from petsc4py import PETSc
 from scipy.spatial import cKDTree
-from ufl import tanh
+from ufl import sqrt, tanh
 
 try:
     from tqdm.auto import tqdm
 except ImportError:
     tqdm = None
-
-from fenics import MPI
 
 from beam_configurator_2d import (
     CantileverBeam2dLinear,
@@ -37,6 +44,31 @@ from parallel import Parallel
 CLAMP_MARKER = 1
 F1_MARKER = 2
 F2_MARKER = 3
+
+
+def _make_mma(x0, ncon, f, g, plot_k, move, lmax, kmax):
+    """Initializes MMA with standard topology optimization bounds and tolerances using mma.py"""
+    mma = MMA_petsc(x0, ncon, f=f, g=g, plot_k=plot_k)
+    mma.xmin[:] = 0.0
+    mma.xmax[:] = 1.0
+    mma.move = move
+    mma.xtol = 1e-4
+    mma.ftol = 1e-5
+    mma.lmax = lmax
+    mma.kmax = kmax
+    mma.kmin = 1
+    return mma
+
+
+def _make_reduced_functional(functional, control):
+    """Copies and optimizes the current tape, then wraps it in a ReducedFunctional.
+    Each functional gets its own tape so derivative() only replays the relevant
+    computation.
+    """
+    tape = fa.get_working_tape()
+    t = tape.copy()
+    t.optimize(controls=[control], functionals=[functional])
+    return fa.ReducedFunctional(functional, control, tape=t)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -67,21 +99,39 @@ class BowspritLoadProperties:
             raise ValueError("The F2 load strip must satisfy 0 <= x_min < x_max <= 1.")
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StressConstraintSettings:
+    """
+    Parameters for the global P-mean stress constraint (Lecture 11/12).
+    sigma_y: yield stress [Pa], e.g. 250e6 for Al 6061-T6.
+    beta_cap: max beta used when computing rho_bar for stress; default 4.8
+              (= beta_lim/2 for R=0.04 m, ny=30, H=0.5 m — avoids artificial
+              stress concentrations at sharp Heaviside transitions).
+    """
+    sigma_y: float
+    epsilon_relaxation: float = 0.2
+    p_stress_schedule: Tuple[int, ...] = (2, 2, 4, 4, 8, 8, 16, 32, 64, 128, 200, 300, 300)
+    alpha: float = 1.0
+    beta_cap: Optional[float] = 4.8
+
+
 @dataclass(frozen=True, slots=True)
 class OptimizationSettings:
     """
-    Tunable parameters for the exam optimization run.
+    Tunable parameters for the optimization run.
     """
     mesh_size: Tuple[int, int] = (230, 30)
     filter_radius: float = 0.04
     volume_fraction: float = 0.25
     pitch_weight_alpha: float = 2.5
     beta_schedule: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-    kmax: int = 40
+    lmax: int = 5
+    kmax: int = 20
     move: float = 0.1
     eta_d: float = 0.45
     eta_i: float = 0.5
     eta_e: float = 0.55
+    stress: Optional[StressConstraintSettings] = None
 
     @property
     def eta3(self):
@@ -131,7 +181,8 @@ class FilterAndProject:
 
     def filter(self, density, radius: Optional[float] = None):
         """
-        Solves -r^2 Laplace(rho_tilde) + rho_tilde = rho in CG1.
+        Solves -r^2 Laplace(rho_tilde) + rho_tilde = rho in CG1 (Lecture 10 PDE filter).
+        CG1 required: DG0 gradients vanish inside cells, killing the diffusion term.
         """
         if radius is None:
             radius = self.radius
@@ -153,7 +204,8 @@ class FilterAndProject:
 
     def project(self, rho_tilde, beta: float, eta: float):
         """
-        Smooth Heaviside projection.
+        Smooth Heaviside projection via tanh regularization (Lecture 10).
+        beta controls sharpness; eta is the projection threshold.
         """
         beta = fa.Constant(beta)
         eta = fa.Constant(eta)
@@ -165,7 +217,9 @@ class FilterAndProject:
 
     def double_filter(self, density, beta: float, eta_min: float, eta: float):
         """
-        Creates one robust physical density realization.
+        One robust realization via the double-filter pipeline (Lecture 10):
+        rho -> filter -> project(eta_min) -> filter -> project(eta_k).
+        eta_min is the dilated threshold (0.45); eta_k is realization-specific.
         """
         rho_tilde_1 = self.filter(density, self.radius)
         rho_bar_1 = self.project(rho_tilde_1, beta, eta_min)
@@ -176,7 +230,7 @@ class FilterAndProject:
 @dataclass(kw_only=True)
 class BowspritTopOpt(CantileverBeam2dLinear):
     """
-    SIMP topology optimization solver for the bowsprit exam problem.
+    SIMP topology optimization solver for the bowsprit problem.
     """
     bowsprit_loads: BowspritLoadProperties = field(default_factory=BowspritLoadProperties)
     penalty: float = 3.0
@@ -192,11 +246,13 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         "preconditioner": "hypre_amg",
     })
 
+    #Initialization of attributes and handling of initialization
     _filter_project: Optional[FilterAndProject] = field(default=None, init=False, repr=False)
     _rho: Optional[Any] = field(default=None, init=False, repr=False)
     _Jhat: Optional[Any] = field(default=None, init=False, repr=False)
     _Vhat: Optional[Any] = field(default=None, init=False, repr=False)
     _Phat: Optional[Any] = field(default=None, init=False, repr=False)
+    _Shat: List[Any] = field(default_factory=list, init=False, repr=False)
 
     _history_rho_file: Optional[Any] = field(default=None, init=False, repr=False)
     _history_rho_bar_file: Optional[Any] = field(default=None, init=False, repr=False)
@@ -207,6 +263,7 @@ class BowspritTopOpt(CantileverBeam2dLinear):
     _history_stride: int = field(default=10, init=False, repr=False)
     _history_iteration: int = field(default=0, init=False, repr=False)
 
+    #Post init creates the model setup after the class is instantiated
     def __post_init__(self):
         super().__post_init__()
         self._create_function_spaces()
@@ -295,6 +352,7 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         alpha_1 = np.deg2rad(loads.f1_angle_deg)
         alpha_2 = np.deg2rad(loads.f2_angle_deg)
 
+        #converts using -cos and sin as the angle is defined on the left side
         T1 = fa.Constant((
             -loads.f1_total_force*np.cos(alpha_1)/(f1_width*thickness),
             loads.f1_total_force*np.sin(alpha_1)/(f1_width*thickness),
@@ -307,7 +365,9 @@ class BowspritTopOpt(CantileverBeam2dLinear):
 
     def stresses_with_simp(self, displacement, rho_bar):
         """
-        Calculates stress with SIMP interpolation of Young's modulus.
+        Stress with SIMP stiffness interpolation (Lecture 9/10):
+        E(rho_bar) = E_min + rho_bar^p * (E0 - E_min).
+        Plane-stress Lamé: lambda_eff = E*nu/(1-nu^2), not the plane-strain 1/(1-2nu) as it is a thin bowsprit.
         """
         epsilon = self.strains(displacement)
         E0 = self.material_properties.e_modulus
@@ -315,7 +375,7 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         E_min = self.e_min_fraction*E0
         E = E_min + rho_bar**self.penalty*(E0 - E_min)
         mu = E/(2.0*(1.0 + nu))
-        lame_lambda = E*nu/((1.0 + nu)*(1.0 - 2.0*nu))
+        lame_lambda = E*nu/(1.0 - nu**2)
         dimensions = displacement.geometric_dimension()
         return lame_lambda*fs.tr(epsilon)*fs.Identity(dimensions) + 2.0*mu*epsilon
 
@@ -340,7 +400,11 @@ class BowspritTopOpt(CantileverBeam2dLinear):
 
     def solve_topopt(self, rho_bar, solver_settings: Optional[Dict] = None):
         """
-        Solves the SIMP linear elasticity problem.
+        Solves the SIMP linear elasticity problem (Lecture 3/4 plane-stress BVP):
+        a(u,v) = t * ∫ sigma(u):eps(v) dx
+        L(v)   = t * ∫ T1.v ds(F1) + T2.v ds(F2)
+        MUMPS direct solver: SIMP E_min/E0=1e-6 causes ill-conditioning
+            that can be problematic with other solvers at high beta values (e.g. gmres diverged)
         """
         if solver_settings is None:
             solver_settings = self.elasticity_solver_settings
@@ -370,7 +434,8 @@ class BowspritTopOpt(CantileverBeam2dLinear):
 
     def compliance(self, displacement):
         """
-        Calculates external work compliance.
+        Calculates external work compliance J = ∫ T.u ds.
+        Equals strain energy for linear elasticity; minimizing J maximizes stiffness.
         """
         T1, T2 = self._traction_forces()
         thickness = self.geometry_properties.thickness
@@ -386,7 +451,9 @@ class BowspritTopOpt(CantileverBeam2dLinear):
 
     def pitch_weighted_volume_fraction_of(self, rho_bar):
         """
-        Calculates weighted volume fraction for pitching-inertia penalty.
+        Pitch-weighted volume fraction with w(x) = 1 + alpha*(x/L)^2.
+        Evaluated on the dilated realization — if dilated satisfies it,
+        all realizations do.
         """
         length = self.geometry_properties.length
         height = self.geometry_properties.height
@@ -408,13 +475,63 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         """
         return self.pitch_weighted_volume_fraction_of(rho_bar) - self.volume_fraction
 
-    def set_up_functionals(self, beta: float, eta_values: List[float]):
+    def stresses_base_material(self, displacement):
+        """
+        Plane-stress tensor computed with base-material E (not SIMP), for stress constraints.
+        Lecture 11 slide 7: stress in constraint uses E0, not E(rho_bar), so that
+        f_sigma(rho_bar) fully accounts for the density interpolation.
+        Plane-stress Lame: lambda_eff = E*nu/(1-nu^2), mu = E/(2*(1+nu)).
+        """
+        epsilon = self.strains(displacement)
+        E0 = self.material_properties.e_modulus
+        nu = self.material_properties.poisson_ratio
+        mu = E0 / (2.0 * (1.0 + nu))
+        lame_lambda = E0 * nu / (1.0 - nu**2)
+        d = displacement.geometric_dimension()
+        return lame_lambda * fs.tr(epsilon) * fs.Identity(d) + 2.0 * mu * epsilon
+
+    def stress_measure(self, displacement, rho_bar, sigma_y, epsilon_relaxation=0.2):
+        """
+        Local stress measure σ_m = f_σ(ρ̄)·√(σ²_vM + σ²_min), Lecture 11 slide 7.
+        f_σ(ρ̄) = ρ̄ / (ε(1-ρ̄) + ρ̄)  relaxes singularity in void regions.
+        σ_vM uses base-material E; σ_min = 1e-4·σ_y prevents 0/0 in voids.
+        """
+        sigma = self.stresses_base_material(displacement)
+        d = displacement.geometric_dimension()
+        mean_stress = fs.tr(sigma) / 3.0        # (σ_11+σ_22)/3 = full 3D mean (σ_33=0)
+        s = sigma - mean_stress * fs.Identity(d)
+        # s_33 = -mean_stress (plane stress: σ_33=0 but s_33≠0)
+        sigma_vm2 = 1.5 * (fs.inner(s, s) + mean_stress**2)
+        sigma_min_sq = (1e-4 * sigma_y) ** 2
+        eps = fa.Constant(epsilon_relaxation)
+        f_sigma = rho_bar / (eps * (1.0 - rho_bar) + rho_bar)
+        return f_sigma * sqrt(sigma_vm2 + sigma_min_sq)
+
+    def p_mean_stress_constraint(self, displacement, rho_bar, p, sigma_y,
+                                  alpha=1.0, epsilon_relaxation=0.2):
+        """
+        Returns σ_c^p - 1 where σ_c^p = (1/|Ω|) ∫ (σ_m/(α·σ_y))^p dΩ.
+        Constraint σ_c^p - 1 ≤ 0 is equivalent to σ_c ≤ 1, Lecture 12 slide 4.
+        """
+        sm = self.stress_measure(displacement, rho_bar, sigma_y, epsilon_relaxation)
+        area = self.geometry_properties.length * self.geometry_properties.height
+        sigma_ref = alpha * sigma_y
+        p_const = fa.Constant(float(p))
+        return fa.assemble((sm / sigma_ref) ** p_const * fs.dx) / area - 1.0
+
+    def set_up_functionals(self, beta: float, eta_values: List[float],
+                           p_stress: Optional[int] = None,
+                           stress_settings: Optional[StressConstraintSettings] = None):
         """
         Builds reduced functionals for objective and constraints.
+        Each functional gets its own optimized tape so derivative() only replays
+        the relevant computation. V and P are evaluated on the dilated realization.
+        When stress_settings is provided, also builds one stress functional per eta.
         """
         control = fa.Control(self._rho)
         tape = fa.get_working_tape()
 
+        # Objective: sum compliance across all realizations.
         tape.clear_tape()
         total_compliance = None
         for eta in sorted(eta_values):
@@ -422,65 +539,68 @@ class BowspritTopOpt(CantileverBeam2dLinear):
             J = self.compliance(displacement)
             total_compliance = J if total_compliance is None else total_compliance + J
 
-        objective_tape = tape.copy()
-        objective_tape.optimize(controls=[control], functionals=[total_compliance])
-        self._Jhat = fa.ReducedFunctional(total_compliance, control, tape=objective_tape)
+        self._Jhat = _make_reduced_functional(total_compliance, control)
 
+        # Volume constraint on dilated realization.
         tape.clear_tape()
         rho_bar_dilated = self.physical_density(beta, eta_values, min(eta_values))
         V = self.volume_constraint(rho_bar_dilated)
-        volume_tape = tape.copy()
-        volume_tape.optimize(controls=[control], functionals=[V])
-        self._Vhat = fa.ReducedFunctional(V, control, tape=volume_tape)
+        self._Vhat = _make_reduced_functional(V, control)
 
+        # Pitch-weighted volume constraint on dilated realization.
         tape.clear_tape()
         rho_bar_pitch = self.physical_density(beta, eta_values, min(eta_values))
         P = self.pitch_constraint(rho_bar_pitch)
-        pitch_tape = tape.copy()
-        pitch_tape.optimize(controls=[control], functionals=[P])
-        self._Phat = fa.ReducedFunctional(P, control, tape=pitch_tape)
+        self._Phat = _make_reduced_functional(P, control)
+
+        # Stress constraint per realization: Lecture 11 slide 7 + Lecture 12 slide 4.
+        # beta_s capped at beta_cap to avoid artificial concentrations (Lecture 11 slide 9).
+        self._Shat = []
+        if stress_settings is not None and p_stress is not None:
+            s = stress_settings
+            beta_s = min(beta, s.beta_cap) if s.beta_cap is not None else beta
+            for eta in sorted(eta_values):
+                tape.clear_tape()
+                displacement_s, rho_bar_s = self.forward(beta_s, eta_values, eta)
+                S = self.p_mean_stress_constraint(
+                    displacement_s, rho_bar_s, p_stress, s.sigma_y, s.alpha, s.epsilon_relaxation
+                )
+                self._Shat.append(_make_reduced_functional(S, control))
 
     def f(self, x):
         """
-        MMA function vector [objective, volume_constraint, pitch_constraint].
+        MMA function vector [J, V, P, S_eta0, S_eta1, ...].
         """
         self._set_density_from_petsc(x)
-        objective = self._Jhat(self._rho)
-        volume = self._Vhat(self._rho)
-        pitch = self._Phat(self._rho)
-        return np.array([float(objective), float(volume), float(pitch)])
+        result = [
+            float(self._Jhat(self._rho)),
+            float(self._Vhat(self._rho)),
+            float(self._Phat(self._rho)),
+        ]
+        for Shat in self._Shat:
+            result.append(float(Shat(self._rho)))
+        return np.array(result)
 
     def g(self, x):
         """
-        MMA gradient matrix.
+        MMA gradient matrix [dJ, dV, dP, dS_eta0, dS_eta1, ...].
         """
         self._set_density_from_petsc(x)
-        dJ = self._Jhat.derivative().vector().get_local()
-        dV = self._Vhat.derivative().vector().get_local()
-        dP = self._Phat.derivative().vector().get_local()
         istart, iend = x.getOwnershipRange()
-        return np.array([dJ[istart:iend], dV[istart:iend], dP[istart:iend]])
+        rows = [
+            self._Jhat.derivative().vector().get_local()[istart:iend],
+            self._Vhat.derivative().vector().get_local()[istart:iend],
+            self._Phat.derivative().vector().get_local()[istart:iend],
+        ]
+        for Shat in self._Shat:
+            rows.append(Shat.derivative().vector().get_local()[istart:iend])
+        return np.array(rows)
 
     def _set_density_from_petsc(self, x):
         rho_array = MMA_petsc.parToLocal(x)
         lo, hi = self._rho.vector().local_range()
         self._rho.vector().set_local(rho_array[lo:hi])
         self._rho.vector().apply("")
-
-    def set_up_optimizer(self, x0, move: float, kmax: int):
-        """
-        Initializes MMA.
-        """
-        mma = MMA_petsc(x0, 2, f=self.f, g=self.g, plot_k=self.plot_k)
-        mma.xmin[:] = 0.0
-        mma.xmax[:] = 1.0
-        mma.move = move
-        mma.xtol = 1e-4
-        mma.ftol = 1e-5
-        mma.lmax = 5
-        mma.kmax = kmax
-        mma.kmin = 1
-        return mma
 
     @staticmethod
     def eta_label(eta: float, eta_values: List[float]):
@@ -554,16 +674,22 @@ class BowspritTopOpt(CantileverBeam2dLinear):
     def optimize(self,
                  eta_values: List[float],
                  beta_schedule: List[float],
+                 lmax_per_stage: int,
                  kmax_per_stage: int,
                  move: float,
                  history_output_dir: Optional[str] = None,
                  history_prefix: str = "history",
-                 history_stride: int = 10):
+                 history_stride: int = 10,
+                 stress_settings: Optional[StressConstraintSettings] = None):
         """
-        Runs beta-continuation topology optimization.
+        Beta-continuation topology optimization (Lecture 10): starts with a soft
+        Heaviside (low beta) and ramps up each stage to drive the design binary.
+        Pass stress_settings to activate per-realization P-mean stress constraints.
         """
+        ncon = 2 + len(eta_values) if stress_settings is not None else 2
         rho_petsc = fa.as_backend_type(self._rho.vector()).vec()
-        mma = self.set_up_optimizer(rho_petsc, move, kmax_per_stage)
+        mma = _make_mma(rho_petsc, ncon, self.f, self.g, self.plot_k, move,
+                        lmax=lmax_per_stage, kmax=kmax_per_stage)
 
         if history_output_dir is not None:
             self.set_up_history(history_output_dir, history_prefix, history_stride, eta_values)
@@ -578,14 +704,18 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         else:
             beta_iterator = beta_schedule
 
-        for beta in beta_iterator:
+        for stage_idx, beta in enumerate(beta_iterator):
+            p_stress = None
+            if stress_settings is not None:
+                sched = stress_settings.p_stress_schedule
+                p_stress = sched[min(stage_idx, len(sched) - 1)]
             if rank == 0 and tqdm is not None:
-                beta_iterator.set_postfix(beta=beta, eta=sorted(eta_values))
+                beta_iterator.set_postfix(beta=beta, eta=sorted(eta_values), p=p_stress)
             elif rank == 0:
-                print("beta=", beta, "eta=", sorted(eta_values))
+                print("beta=", beta, "eta=", sorted(eta_values), "p_stress=", p_stress)
             self._history_beta = beta
             self._history_eta_values = eta_values
-            self.set_up_functionals(beta, eta_values)
+            self.set_up_functionals(beta, eta_values, p_stress, stress_settings)
             mma.solve(rho_petsc)
 
         self._set_density_from_petsc(mma.x)
@@ -618,19 +748,39 @@ class BowspritTopOpt(CantileverBeam2dLinear):
                     eta: float,
                     prefix: str,
                     output_dir: str,
-                    rho_array: Optional[np.ndarray] = None):
+                    rho_array: Optional[np.ndarray] = None,
+                    stress_settings: Optional["StressConstraintSettings"] = None):
         """
         Saves one final density and displacement realization.
+        Returns (J, V, V_pitch, sigma_max_Pa) where sigma_max_Pa is None
+        when stress_settings is not provided.
         """
         os.makedirs(output_dir, exist_ok=True)
         displacement, rho_bar = self.evaluate_design(beta, eta_values, eta, rho_array)
         rho_bar.rename("rho_bar", "physical density")
         fs.File(os.path.join(output_dir, f"{prefix}_rho_bar.pvd")) << rho_bar
         fs.File(os.path.join(output_dir, f"{prefix}_u.pvd")) << displacement
+
+        sigma_max = None
+        if stress_settings is not None:
+            fa.pause_annotation()
+            try:
+                s = stress_settings
+                sm_expr = self.stress_measure(
+                    displacement, rho_bar, s.sigma_y, s.epsilon_relaxation
+                )
+                sigma_m = fa.project(sm_expr, fs.FunctionSpace(self.mesh, "DG", 0))
+                sigma_m.rename("sigma_m", "stress measure")
+                fs.File(os.path.join(output_dir, f"{prefix}_sigma_m.pvd")) << sigma_m
+                sigma_max = float(sigma_m.vector().max())
+            finally:
+                fa.continue_annotation()
+
         return (
             float(self.compliance(displacement)),
             float(self.volume_fraction_of(rho_bar)),
             float(self.pitch_weighted_volume_fraction_of(rho_bar)),
+            sigma_max,
         )
 
     def save_marked_faces(self, output_dir: str, prefix: str = "bowsprit"):
@@ -658,12 +808,11 @@ class _GroupBowspritTopOpt(BowspritTopOpt):
 class ParallelBowspritOptimizer:
     """
     Runs one BowspritTopOpt per eta realization on separate MPI communicator groups
-    so all realizations solve their FEM simultaneously.
+    so all realizations solve their FEM simultaneously (Lecture 8).
 
-    Follows the eight-step Parallel class pattern from Lecture 8.
-    Launch with: mpiexec -n N python bowsprit_topopt.py
-    Recommended N: divisible by len(eta_values).  For both tasks together use N=12
-    (task3: 3 groups x 4 cores, task4: 2 groups x 6 cores).
+    Launch: mpiexec -n N python bowsprit_topopt.py
+    N must be divisible by len(eta_values). For three realizations N=6 is used
+    (3 groups x 2 cores); for two realizations, 2 groups x 3 cores as my ryzen 7 4800H has 8c/16t.
     """
     material_properties: MaterialProperties2d
     geometry_properties: GeometryProperties2d
@@ -679,6 +828,7 @@ class ParallelBowspritOptimizer:
     _Jhat_group: Optional[Any] = field(default=None, init=False, repr=False)
     _Vhat_group: Optional[Any] = field(default=None, init=False, repr=False)
     _Phat_group: Optional[Any] = field(default=None, init=False, repr=False)
+    _Shat_group: Optional[Any] = field(default=None, init=False, repr=False)
     _current_beta: float = field(default=1.0, init=False, repr=False)
     _my_eta: float = field(default=0.5, init=False, repr=False)
     _history_rho_file: Optional[Any] = field(default=None, init=False, repr=False)
@@ -690,20 +840,19 @@ class ParallelBowspritOptimizer:
         ngroups = len(self.eta_values)
         eta_sorted = sorted(self.eta_values)
 
-        # Step 3: split world communicator into ngroups groups
+        # split world communicator into ngroups groups
         self._parallel = Parallel(MPI.comm_world, ngroups)
         self._my_eta = eta_sorted[self._parallel.group]
 
         kwargs = self._beam_kwargs()
 
-        # Step 1: world-comm beam for MMA rho space and final evaluation
+        # world-comm beam for MMA variable space and final design evaluation
         self._beam_world = BowspritTopOpt(**kwargs)
 
-        # Step 2–5: group mesh created identically to BowspritTopOpt.mesh but on
-        # the group communicator.  RectangleMesh.create returns the Python
-        # dolfin.Mesh subclass that fenics_adjoint has overloaded; reading from
-        # XDMF returns the raw dolfin.cpp.mesh.Mesh binding and would cause an
-        # '_ad_will_add_as_dependency' AttributeError inside fa.solve.
+        # group mesh created identically to BowspritTopOpt.mesh but on the group
+        # communicator. RectangleMesh.create returns the fenics_adjoint-overloaded
+        # Python Mesh subclass; reading from XDMF returns the raw cpp binding and
+        # causes an '_ad_will_add_as_dependency' AttributeError inside fa.solve.
         length = self.geometry_properties.length
         height = self.geometry_properties.height
         nx, ny = self.settings.mesh_size
@@ -716,7 +865,7 @@ class ParallelBowspritOptimizer:
 
         self._beam_group = _GroupBowspritTopOpt(**kwargs, group_mesh=group_mesh)
 
-        # Step 4: global rho for MMA on world comm (DG0 to match group space)
+        # global rho for MMA on world comm (DG0 to match group space)
         Vd_global = fs.FunctionSpace(self._beam_world.mesh, "DG", 0)
         self._rho_global = fa.interpolate(
             fa.Constant(self.settings.volume_fraction),
@@ -724,11 +873,7 @@ class ParallelBowspritOptimizer:
         )
         self._rho_global.rename("rho", "design variable")
 
-        # Step 6: DOF mapping between world and group function spaces.
-        # parallel.py's create_mapping uses np.isin which returns matches in
-        # coor_all's order, not coor_group's order, scrambling the mapping when
-        # the two communicators partition cells differently.  We build the
-        # correct mapping via nearest-neighbour coordinate lookup instead.
+        # DOF mapping between world and group function spaces (see _build_dof_mapping).
         self._build_dof_mapping(Vd_global, self._beam_group._filter_project.Vd)
 
     def _beam_kwargs(self) -> Dict:
@@ -746,14 +891,13 @@ class ParallelBowspritOptimizer:
 
     def _build_dof_mapping(self, Vd_global, Vd_group):
         """
-        Build correct DOF mapping between world and group DG0 spaces.
+        Builds the DOF mapping between world and group DG0 spaces.
 
-        parallel.py's create_mapping pairs DOFs by their position in
-        coor_all (sorted by np.isin output), not by matching coordinate to
-        coor_group[i].  When the two communicators partition cells differently
-        the local orderings diverge and the mapping is scrambled.  We fix
-        this with a nearest-neighbour lookup so each group-local DOF is
-        paired with the world DOF at the same physical coordinate.
+        Replaces parallel.py:create_mapping, which pairs DOFs by their position in
+        coor_all (np.isin output order) rather than by physical coordinate. When the
+        two communicators partition cells differently the orderings diverge and the
+        mapping is wrong. A nearest-neighbour cKDTree lookup fixes this: each
+        group-local DOF is matched to the world DOF at the same coordinate.
         """
         par = self._parallel
         par.Vglobal = Vd_global
@@ -784,12 +928,15 @@ class ParallelBowspritOptimizer:
             g2g[dof_all[idx]] = dof_group[i]
         par.group2global = sum(par.group_comm.allgather(g2g))
 
-    def set_up_functionals(self, beta: float):
+    def set_up_functionals(self, beta: float,
+                           p_stress: Optional[int] = None,
+                           stress_settings: Optional[StressConstraintSettings] = None):
         """
         Builds one ReducedFunctional per functional per group.
         Each group records its own eta realization on a separate tape.
-        All groups record V and P using the dilated (min-eta) projection so
-        vgroup2global can gather from all groups and we use group-0's result.
+        All groups record V and P on the dilated projection; group-0's value is
+        used for the constraint since rho is shared across groups.
+        When stress_settings is provided, each group records its own stress functional.
         """
         control = fa.Control(self._beam_group._rho)
         tape = fa.get_working_tape()
@@ -797,26 +944,31 @@ class ParallelBowspritOptimizer:
         tape.clear_tape()
         displacement, _ = self._beam_group.forward(beta, self.eta_values, self._my_eta)
         J = self._beam_group.compliance(displacement)
-        J_tape = tape.copy()
-        J_tape.optimize(controls=[control], functionals=[J])
-        self._Jhat_group = fa.ReducedFunctional(J, control, tape=J_tape)
+        self._Jhat_group = _make_reduced_functional(J, control)
 
         tape.clear_tape()
         rho_bar_d = self._beam_group.physical_density(beta, self.eta_values, min(self.eta_values))
         V = self._beam_group.volume_constraint(rho_bar_d)
-        V_tape = tape.copy()
-        V_tape.optimize(controls=[control], functionals=[V])
-        self._Vhat_group = fa.ReducedFunctional(V, control, tape=V_tape)
+        self._Vhat_group = _make_reduced_functional(V, control)
 
         tape.clear_tape()
         rho_bar_d2 = self._beam_group.physical_density(beta, self.eta_values, min(self.eta_values))
         P = self._beam_group.pitch_constraint(rho_bar_d2)
-        P_tape = tape.copy()
-        P_tape.optimize(controls=[control], functionals=[P])
-        self._Phat_group = fa.ReducedFunctional(P, control, tape=P_tape)
+        self._Phat_group = _make_reduced_functional(P, control)
+
+        self._Shat_group = None
+        if stress_settings is not None and p_stress is not None:
+            s = stress_settings
+            beta_s = min(beta, s.beta_cap) if s.beta_cap is not None else beta
+            tape.clear_tape()
+            displacement_s, rho_bar_s = self._beam_group.forward(beta_s, self.eta_values, self._my_eta)
+            S = self._beam_group.p_mean_stress_constraint(
+                displacement_s, rho_bar_s, p_stress, s.sigma_y, s.alpha, s.epsilon_relaxation
+            )
+            self._Shat_group = _make_reduced_functional(S, control)
 
     def _sync_rho(self, x):
-        """Transfer MMA PETSc vector → global rho → group rho (steps 7–8)."""
+        """Transfer MMA PETSc vector -> global rho -> group rho."""
         rho_arr = MMA_petsc.parToLocal(x)
         lo, hi = self._rho_global.vector().local_range()
         self._rho_global.vector().set_local(rho_arr[lo:hi])
@@ -825,9 +977,9 @@ class ParallelBowspritOptimizer:
 
     def f(self, x):
         """
-        MMA function vector [objective, volume_constraint, pitch_constraint].
-        All groups evaluate in parallel; objective sums across groups,
-        constraints taken from group 0 (dilated realization).
+        MMA function vector [J, V, P, S_group0, S_group1, ...].
+        Objective sums across groups; V and P from group 0 (dilated);
+        each group contributes one stress value gathered in group order.
         """
         self._sync_rho(x)
         Ji = float(self._Jhat_group(self._beam_group._rho))
@@ -836,18 +988,27 @@ class ParallelBowspritOptimizer:
         Js = self._parallel.sgroup2global(Ji)
         Vs = self._parallel.sgroup2global(Vi)
         Ps = self._parallel.sgroup2global(Pi)
-        return np.array([float(np.sum(Js)), float(Vs[0]), float(Ps[0])])
+        result = [float(np.sum(Js)), float(Vs[0]), float(Ps[0])]
+        if self._Shat_group is not None:
+            Si = float(self._Shat_group(self._beam_group._rho))
+            Ss = self._parallel.sgroup2global(Si)
+            result.extend(float(s) for s in Ss)
+        return np.array(result)
 
     def g(self, x):
         """
-        MMA gradient matrix.
-        dJ sums gradients across all groups; dV and dP taken from group 0.
+        MMA gradient matrix [dJ, dV, dP, dS_group0, dS_group1, ...].
+        dJ sums across groups; dV, dP from group 0; each dS_k from group k.
         """
         self._sync_rho(x)
         dJs = self._parallel.vgroup2global(self._Jhat_group.derivative().vector())
         dVs = self._parallel.vgroup2global(self._Vhat_group.derivative().vector())
         dPs = self._parallel.vgroup2global(self._Phat_group.derivative().vector())
-        return np.array([np.sum(dJs, axis=0), dVs[0], dPs[0]])
+        rows = [np.sum(dJs, axis=0), dVs[0], dPs[0]]
+        if self._Shat_group is not None:
+            dSs = self._parallel.vgroup2global(self._Shat_group.derivative().vector())
+            rows.extend(dSs)
+        return np.array(rows)
 
     def set_up_history(self, output_dir: str, prefix: str, stride: int):
         os.makedirs(output_dir, exist_ok=True)
@@ -882,22 +1043,18 @@ class ParallelBowspritOptimizer:
 
     def optimize(self,
                  beta_schedule: List[float],
+                 lmax_per_stage: int,
                  kmax_per_stage: int,
                  move: float,
                  history_output_dir: Optional[str] = None,
                  history_prefix: str = "history",
-                 history_stride: int = 10):
-        """Runs beta-continuation topology optimization across parallel realization groups."""
+                 history_stride: int = 10,
+                 stress_settings: Optional[StressConstraintSettings] = None):
+        """Beta-continuation topology optimization across parallel realization groups (Lecture 10)."""
+        ncon = 2 + len(self.eta_values) if stress_settings is not None else 2
         rho_petsc = fa.as_backend_type(self._rho_global.vector()).vec()
-        mma = MMA_petsc(rho_petsc, 2, f=self.f, g=self.g, plot_k=self.plot_k)
-        mma.xmin[:] = 0.0
-        mma.xmax[:] = 1.0
-        mma.move = move
-        mma.xtol = 1e-4
-        mma.ftol = 1e-5
-        mma.lmax = 5
-        mma.kmax = kmax_per_stage
-        mma.kmin = 1
+        mma = _make_mma(rho_petsc, ncon, self.f, self.g, self.plot_k, move,
+                        lmax=lmax_per_stage, kmax=kmax_per_stage)
 
         if history_output_dir is not None:
             self.set_up_history(history_output_dir, history_prefix, history_stride)
@@ -912,13 +1069,17 @@ class ParallelBowspritOptimizer:
         else:
             beta_iterator = beta_schedule
 
-        for beta in beta_iterator:
+        for stage_idx, beta in enumerate(beta_iterator):
+            p_stress = None
+            if stress_settings is not None:
+                sched = stress_settings.p_stress_schedule
+                p_stress = sched[min(stage_idx, len(sched) - 1)]
             if rank == 0 and tqdm is not None:
-                beta_iterator.set_postfix(beta=beta, eta=self._my_eta)
+                beta_iterator.set_postfix(beta=beta, eta=self._my_eta, p=p_stress)
             elif rank == 0:
-                print("beta=", beta, "group eta=", self._my_eta)
+                print("beta=", beta, "group eta=", self._my_eta, "p_stress=", p_stress)
             self._current_beta = beta
-            self.set_up_functionals(beta)
+            self.set_up_functionals(beta, p_stress, stress_settings)
             mma.solve(rho_petsc)
 
         rho_arr = MMA_petsc.parToLocal(mma.x)
@@ -933,9 +1094,12 @@ class ParallelBowspritOptimizer:
                     eta: float,
                     prefix: str,
                     output_dir: str,
-                    rho_array: Optional[np.ndarray] = None):
+                    rho_array: Optional[np.ndarray] = None,
+                    stress_settings: Optional[StressConstraintSettings] = None):
         """Delegates final design evaluation to the world-comm beam."""
-        return self._beam_world.save_design(beta, eta_values, eta, prefix, output_dir, rho_array)
+        return self._beam_world.save_design(
+            beta, eta_values, eta, prefix, output_dir, rho_array, stress_settings
+        )
 
     def save_marked_faces(self, output_dir: str, prefix: str = "bowsprit"):
         return self._beam_world.save_marked_faces(output_dir, prefix)
@@ -951,23 +1115,8 @@ def make_run_directory(base_dir="plots"):
     return output_dir
 
 
-def make_bowsprit(material, geometry, loads, settings: OptimizationSettings):
-    """
-    Creates a bowsprit optimizer from the shared run settings.
-    """
-    return BowspritTopOpt(
-        material_properties=material,
-        geometry_properties=geometry,
-        loads=loads,
-        mesh_size=settings.mesh_size,
-        verbose=False,
-        filter_radius=settings.filter_radius,
-        volume_fraction=settings.volume_fraction,
-        pitch_weight_alpha=settings.pitch_weight_alpha,
-    )
-
-
-def save_final_realizations(beam, beta, eta_values, rho_array, task_name, labels, output_root):
+def save_final_realizations(beam, beta, eta_values, rho_array, task_name, labels, output_root,
+                            stress_settings=None):
     results = {}
     output_dir = os.path.join(output_root, task_name)
     for eta, label in labels.items():
@@ -978,12 +1127,15 @@ def save_final_realizations(beam, beta, eta_values, rho_array, task_name, labels
             f"{task_name}_{label}",
             output_dir,
             rho_array,
+            stress_settings,
         )
         results[label] = result
         if PETSc.COMM_WORLD.getRank() == 0:
+            J, V, V_pitch, sigma_max = result
+            stress_str = f", σ_max = {sigma_max/1e6:.1f} MPa" if sigma_max is not None else ""
             print(
                 f"{task_name} {label}: "
-                f"J = {result[0]:.4e}, V = {result[1]:.3f}, V_pitch = {result[2]:.3f}"
+                f"J = {J:.4e}, V = {V:.3f}, V_pitch = {V_pitch:.3f}{stress_str}"
             )
     return results
 
@@ -992,17 +1144,27 @@ def print_comparison(results3, results4):
     if PETSc.COMM_WORLD.getRank() != 0:
         return
 
+    has_stress = results3["dilated"][3] is not None
+    header = f"{'Design':24s} {'J':>12s} {'V':>8s} {'V_pitch':>10s}"
+    if has_stress:
+        header += f" {'σ_max [MPa]':>14s}"
     print("\nDesign comparison")
-    print(f"{'Design':24s} {'J':>12s} {'V':>8s} {'V_pitch':>10s}")
-    print("-"*60)
+    print(header)
+    print("-" * (74 if has_stress else 60))
 
     for label in ["dilated", "nominal", "eroded"]:
-        J, V, V_pitch = results3[label]
-        print(f"3-design {label:12s} {J:12.4e} {V:8.3f} {V_pitch:10.3f}")
+        J, V, V_pitch, sigma_max = results3[label]
+        line = f"3-design {label:12s} {J:12.4e} {V:8.3f} {V_pitch:10.3f}"
+        if has_stress:
+            line += f" {sigma_max/1e6:14.1f}"
+        print(line)
 
     for label in ["dilated", "intermediate", "eroded"]:
-        J, V, V_pitch = results4[label]
-        print(f"2-design {label:12s} {J:12.4e} {V:8.3f} {V_pitch:10.3f}")
+        J, V, V_pitch, sigma_max = results4[label]
+        line = f"2-design {label:12s} {J:12.4e} {V:8.3f} {V_pitch:10.3f}"
+        if has_stress:
+            line += f" {sigma_max/1e6:14.1f}" if sigma_max is not None else f" {'N/A':>14s}"
+        print(line)
 
     difference = (
         100.0*(results4["intermediate"][0] - results3["nominal"][0])
@@ -1012,14 +1174,26 @@ def print_comparison(results3, results4):
 
 
 if __name__ == "__main__":
-    # Run with: mpiexec -n 12 python bowsprit_topopt.py
-    # 12 processes: task3 uses 3 groups x 4 cores, task4 uses 2 groups x 6 cores.
+    # Run with: mpiexec -n 6 python bowsprit_topopt.py
+    #  processes: task3 uses 3 groups x 2 cores, task4 uses 2 groups x 3 cores.
     fs.set_log_level(30)
 
     material = MaterialProperties2d(e_modulus=70e9, poisson_ratio=0.33, density=None)
     geometry = GeometryProperties2d(length=3.80, height=0.5, thickness=0.05)
     loads = LoadCase2d()
-    settings = OptimizationSettings(mesh_size=(460, 60))
+    beta_schedule = (1, 2, 3, 4, 5, 8, 12, 16, 24, 36, 72, 108, 144, 288, 432)
+    # Stress constraint: Al 6061-T6 yield stress 250 MPa so value way below is chosen 
+    #   to account for sudden dynamical loading
+    # beta_cap=9.6 ≈ beta_lim/2 for R=0.04 m, ny=60, H=0.5 m (see Lecture 11 slide 9).
+    # p_stress_schedule length matches beta_schedule (15 stages).
+    stress = StressConstraintSettings(
+        sigma_y=40e6,
+        p_stress_schedule=(2, 2, 4, 4, 8, 8, 16, 32, 64, 128, 200, 300, 300, 400, 400),
+        beta_cap=4.8#9.6,  # 2R/l_e = 2*0.04/(0.5/60) for ny=60 mesh
+    )
+    settings = OptimizationSettings(
+        filter_radius=0.02, mesh_size=(460, 60), volume_fraction=0.25, pitch_weight_alpha=2.5, lmax=15, kmax=30, move=0.2, beta_schedule=beta_schedule, stress=stress
+    )
     history_stride = int(os.environ.get("BOWSPRIT_HISTORY_STRIDE", "10"))
     output_root = make_run_directory("plots")
 
@@ -1041,11 +1215,13 @@ if __name__ == "__main__":
 
     rho3 = opt3.optimize(
         beta_schedule=settings.beta_schedule,
+        lmax_per_stage=settings.lmax,
         kmax_per_stage=settings.kmax,
         move=settings.move,
         history_output_dir=os.path.join(output_root, "task3"),
         history_prefix="task3",
         history_stride=history_stride,
+        stress_settings=settings.stress,
     )
     results3 = save_final_realizations(
         opt3,
@@ -1055,6 +1231,7 @@ if __name__ == "__main__":
         "task3",
         {settings.eta_d: "dilated", settings.eta_i: "nominal", settings.eta_e: "eroded"},
         output_root,
+        stress_settings=settings.stress,
     )
 
     # Task 4: optimize using dilated and eroded realizations in parallel.
@@ -1067,11 +1244,13 @@ if __name__ == "__main__":
     )
     rho4 = opt4.optimize(
         beta_schedule=settings.beta_schedule,
+        lmax_per_stage=settings.lmax,
         kmax_per_stage=settings.kmax,
         move=settings.move,
         history_output_dir=os.path.join(output_root, "task4"),
         history_prefix="task4",
         history_stride=history_stride,
+        stress_settings=settings.stress,
     )
     results4 = save_final_realizations(
         opt4,
@@ -1081,6 +1260,7 @@ if __name__ == "__main__":
         "task4",
         {settings.eta_d: "dilated", settings.eta_e: "eroded"},
         output_root,
+        stress_settings=settings.stress,
     )
     results4["intermediate"] = opt4.save_design(
         settings.beta_final,
@@ -1089,6 +1269,39 @@ if __name__ == "__main__":
         "task4_intermediate",
         os.path.join(output_root, "task4"),
         rho4,
+        settings.stress,
     )
 
     print_comparison(results3, results4)
+
+    if PETSc.COMM_WORLD.getRank() == 0:
+        vf = settings.volume_fraction
+        tol = 0.005
+
+        sigma_y = settings.stress.sigma_y if settings.stress is not None else None
+
+        def _constraint_status(V, Vp, sm, vf, tol, sigma_y):
+            statuses = []
+            for name, val in [("vol", V), ("pitch", Vp)]:
+                if val > vf + tol:
+                    statuses.append(f"{name}:VIOLATED({val:.3f}>{vf:.3f})")
+                elif abs(val - vf) <= tol:
+                    statuses.append(f"{name}:binding")
+                else:
+                    statuses.append(f"{name}:slack({val:.3f})")
+            if sigma_y is not None and sm is not None:
+                ratio = sm / sigma_y
+                if ratio > 1.0 + tol:
+                    statuses.append(f"stress:VIOLATED(σ_max={sm/1e6:.1f}>{sigma_y/1e6:.0f}MPa)")
+                elif abs(ratio - 1.0) <= tol:
+                    statuses.append(f"stress:binding(σ_max={sm/1e6:.1f}MPa)")
+                else:
+                    statuses.append(f"stress:slack(σ_max={sm/1e6:.1f}MPa)")
+            return "  ".join(statuses)
+
+        print(f"\nConstraint diagnostic  (V_f={vf:.3f}, σ_y={sigma_y/1e6:.0f}MPa)")
+        print("-" * 100)
+        for label, (J, V, Vp, sm) in results3.items():
+            print(f"  task3 {label:16s}  {_constraint_status(V, Vp, sm, vf, tol, sigma_y)}")
+        for label, (J, V, Vp, sm) in results4.items():
+            print(f"  task4 {label:16s}  {_constraint_status(V, Vp, sm, vf, tol, sigma_y)}")

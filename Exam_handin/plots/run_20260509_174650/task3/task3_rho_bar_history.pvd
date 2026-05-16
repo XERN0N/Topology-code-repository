@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<VTKFile type="Collection" version="0.1">
+  <Collection>
+    <DataSet timestep="0" part="0" file="task3_rho_bar_history000000.pvtu" />
+    <DataSet timestep="10" part="0" file="task3_rho_bar_history000001.pvtu" />
+    <DataSet timestep="20" part="0" file="task3_rho_bar_history000002.pvtu" />
+    <DataSet timestep="30" part="0" file="task3_rho_bar_history000003.pvtu" />
+    <DataSet timestep="40" part="0" file="task3_rho_bar_history000004.pvtu" />
+    <DataSet timestep="50" part="0" file="task3_rho_bar_history000005.pvtu" />
+    <DataSet timestep="60" part="0" file="task3_rho_bar_history000006.pvtu" />
+    <DataSet timestep="70" part="0" file="task3_rho_bar_history000007.pvtu" />
+    <DataSet timestep="80" part="0" file="task3_rho_bar_history000008.pvtu" />
+    <DataSet timestep="90" part="0" file="task3_rho_bar_history000009.pvtu" />
+    <DataSet timestep="100" part="0" file="task3_rho_bar_history000010.pvtu" />
+    <DataSet timestep="110" part="0" file="task3_rho_bar_history000011.pvtu" />
+    <DataSet timestep="120" part="0" file="task3_rho_bar_history000012.pvtu" />
+    <DataSet timestep="130" part="0" file="task3_rho_bar_history000013.pvtu" />
+  </Collection>
+</VTKFile>

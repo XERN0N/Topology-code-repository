@@ -2,7 +2,7 @@
 
 ## Problem Statement
 
-2D plane-strain bowsprit spar, modelled as a rectangular cantilever.
+2D plane-stress bowsprit spar, modelled as a rectangular cantilever.
 
 | Parameter | Value |
 |---|---|
@@ -104,13 +104,20 @@ E(ρ̄) = E_min + ρ̄^p · (E₀ − E_min)
 
 ### 6. Linear elasticity solve
 
-For each realization k, the displacement u_k is found by solving the plane-strain linear elasticity problem
+For each realization k, the displacement u_k is found by solving the plane-stress linear elasticity problem
 
 ```
 ∫ σ(u_k) : ε(v) dx = ∫ T · v ds     ∀v ∈ V
 ```
 
-where ε = ½(∇u + ∇uᵀ) is the small-strain tensor, σ = λ tr(ε) I + 2μ ε is the Cauchy stress (with Lamé constants λ = E ν / ((1+ν)(1−2ν)), μ = E / (2(1+ν))), and T is the boundary traction from F1 and F2.
+where ε = ½(∇u + ∇uᵀ) is the small-strain tensor, σ = λ_eff tr(ε) I + 2μ ε is the Cauchy stress with **plane-stress** Lamé constants:
+
+```
+λ_eff = E ν / (1 − ν²)       (plane stress, NOT plane strain)
+μ     = E / (2(1+ν))
+```
+
+(Plane strain would use λ = Eν / ((1+ν)(1−2ν)); plane stress replaces the denominator with (1−ν²).) T is the boundary traction from F1 and F2.
 
 Boundary conditions: u = 0 on the clamped left edge.
 
@@ -153,7 +160,49 @@ w(x) = 1 + α (x/L)²,    α = 2.5
 
 Both constraints use the dilated realization (most material), so satisfying them for the dilated design guarantees they hold for the nominal and eroded designs too.
 
-### 10. Adjoint gradient computation
+### 10. Stress constraint (P-mean global aggregation)
+
+A global P-mean stress constraint is added per realization, following Lecture 11 (slides 7, 9, 12) and Lecture 12 (slides 4, 5).
+
+**Stress measure with ε-relaxation** (avoids singularity in void regions):
+
+```
+f_σ(ρ̄)  = ρ̄ / (ε(1−ρ̄) + ρ̄)          ε = 0.2 fixed
+σ_vM²   = (3/2)(s_ij s_ij)_3D          full 3D deviatoric, corrected for plane stress
+σ_min   = 1e-4 · σ_y                   floor preventing √0 in voids
+σ_m(x)  = f_σ(ρ̄) · √(σ_vM² + σ_min²)
+```
+
+σ is computed with **base-material E** (not SIMP E), so the stress represents the solid-material stress, and f_σ accounts for interpolation. σ_vM uses the **corrected plane-stress formula**:
+
+```
+mean_stress = tr(σ) / 3 = (σ_11 + σ_22) / 3
+s_2D = σ − mean_stress · I       (2D in-plane deviatoric)
+s_33 = −mean_stress               (σ_33=0 in plane stress, but s_33≠0)
+σ_vM² = 1.5 · (inner(s_2D, s_2D) + mean_stress²)
+```
+
+This gives σ_vM² = σ_11² + σ_22² − σ_11σ_22 + 3σ_12², the standard plane-stress formula.
+(Using only `1.5·inner(s_2D, s_2D)` drops the s_33² term and underestimates σ_vM by up to ~15%.)
+
+**P-mean global aggregation** (Lecture 12 slide 4):
+
+```
+σ_c^p = (1/|Ω|) ∫_Ω (σ_m / (α·σ_y))^p dΩ
+constraint: σ_c^p − 1 ≤ 0   (equivalent to σ_c ≤ 1 for p>0)
+```
+
+Using σ_c^p instead of σ_c avoids the p-th root operation, keeping the pyadjoint tape simple.
+
+**β cap** (Lecture 11 slide 9): β used for the stress rho_bar is capped at β_cap = β_lim/2 = 2R/l_e. Above this, the sharp Heaviside creates artificial stress concentrations at projection transitions. With R=0.04 m, l_e ≈ H/ny = 0.5/30 ≈ 0.017 m → β_cap ≈ 4.8.
+
+**P-continuation**: p is raised per beta stage (e.g., 2→300 over 13 stages). At small p, σ_c^p averages the field and the constraint is loose but smooth. At large p, σ_c^p → max(σ_m/(α·σ_y)) and the constraint approaches a true maximum-stress constraint.
+
+**p exponent as Constant**: `p` is wrapped in `fa.Constant(float(p))` so FEniCS JIT-compiles the form once (fixed structure) and only the constant value changes between stages. Using a plain Python int would create structurally distinct UFL forms for each p value, triggering re-compilation at every stage.
+
+**Per-realization constraints**: one stress constraint per η realization (dilated, nominal, eroded). ncon increases from 2 to 2+len(eta_values).
+
+### 11. Adjoint gradient computation
 
 Gradients of J, V, P with respect to ρ are computed via pyadjoint. Each forward solve is recorded on a tape. A `ReducedFunctional` object then differentiates the tape in reverse (adjoint solve) to give dJ/dρ, dV/dρ, dP/dρ at the cost of one additional linear solve per functional. No hand-derived adjoint is needed.
 
@@ -244,7 +293,7 @@ Single-group SIMP solver. Key methods:
 | `mesh` | Creates `RectangleMesh.create` (pyadjoint-compatible) |
 | `_mark_end_faces` | Marks CLAMP (1), F1 strip (2), F2 strip (3) |
 | `_traction_forces` | Converts total force to `Constant((Tx, Ty))` traction |
-| `stresses_with_simp` | SIMP stiffness E(ρ̄) + plane-strain σ |
+| `stresses_with_simp` | SIMP stiffness E(ρ̄) + plane-stress σ |
 | `physical_density` | Calls `double_filter` for one realization |
 | `forward` | Runs physical density + elasticity solve |
 | `compliance` | External work `∫ T · u ds` |

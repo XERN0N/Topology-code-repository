@@ -213,7 +213,8 @@ class CantileverBeam2dLinear:
     @staticmethod
     def strains(trial_function):
         """
-        Calculates strains for the trial function u.
+        Calculates strains for the trial func
+        tion u.
         """
         return 0.5*(fs.grad(trial_function)+fs.grad(trial_function).T)    
 
