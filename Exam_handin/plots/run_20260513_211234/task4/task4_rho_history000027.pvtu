@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<VTKFile type="PUnstructuredGrid" version="0.1">
+  <PUnstructuredGrid GhostLevel="0">
+    <PPoints>
+      <PDataArray type="Float64" NumberOfComponents="3" />
+    </PPoints>
+    <PCellData>
+      <PDataArray type="UInt32" Name="connectivity" />
+      <PDataArray type="UInt32" Name="offsets" />
+      <PDataArray type="UInt8" Name="types" />
+    </PCellData>
+    <PCellData Scalars="rho">
+      <PDataArray type="Float64" Name="rho" NumberOfComponents="0" />
+    </PCellData>
+    <Piece Source="task4_rho_history_p0_000027.vtu" />
+    <Piece Source="task4_rho_history_p1_000027.vtu" />
+    <Piece Source="task4_rho_history_p2_000027.vtu" />
+    <Piece Source="task4_rho_history_p3_000027.vtu" />
+    <Piece Source="task4_rho_history_p4_000027.vtu" />
+    <Piece Source="task4_rho_history_p5_000027.vtu" />
+  </PUnstructuredGrid>
+</VTKFile>
