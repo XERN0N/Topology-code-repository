@@ -9,8 +9,12 @@ Compliance objective J = ∫ T·u ds (external work, equals strain energy for
 linear elasticity).
 
 _build_dof_mapping replaces parallel.py:create_mapping, which pairs DOFs by
-np.isin position rather than by coordinate and scrambles the mapping when the
+np.isin position rather than by coordinate and causes problems with the mapping when the
 two communicators partition cells differently.
+
+beam_configurator_2d.py is my own submission from the assignment earlier in the course.
+mma.py is from the brightspace course site by Søren Madsen
+parallel.py is from the brightspace course site by Søren Madsen
 """
 
 import os
@@ -365,9 +369,9 @@ class BowspritTopOpt(CantileverBeam2dLinear):
 
     def stresses_with_simp(self, displacement, rho_bar):
         """
-        Stress with SIMP stiffness interpolation (Lecture 9/10):
+        Stress with SIMP stiffness interpolation (Lecture 6 p. 9):
         E(rho_bar) = E_min + rho_bar^p * (E0 - E_min).
-        Plane-stress Lamé: lambda_eff = E*nu/(1-nu^2), not the plane-strain 1/(1-2nu) as it is a thin bowsprit.
+        Plane-stress Lamé: lambda_eff = E*nu/(1-nu^2) as it is a thin bowsprit (lecture 3 p. 7-9).
         """
         epsilon = self.strains(displacement)
         E0 = self.material_properties.e_modulus
@@ -400,7 +404,7 @@ class BowspritTopOpt(CantileverBeam2dLinear):
 
     def solve_topopt(self, rho_bar, solver_settings: Optional[Dict] = None):
         """
-        Solves the SIMP linear elasticity problem (Lecture 3/4 plane-stress BVP):
+        Solves the SIMP linear elasticity problem (Lecture 3 p. 7-9 plane-stress BVP):
         a(u,v) = t * ∫ sigma(u):eps(v) dx
         L(v)   = t * ∫ T1.v ds(F1) + T2.v ds(F2)
         MUMPS direct solver: SIMP E_min/E0=1e-6 causes ill-conditioning
@@ -510,14 +514,15 @@ class BowspritTopOpt(CantileverBeam2dLinear):
     def p_mean_stress_constraint(self, displacement, rho_bar, p, sigma_y,
                                   alpha=1.0, epsilon_relaxation=0.2):
         """
-        Returns σ_c^p - 1 where σ_c^p = (1/|Ω|) ∫ (σ_m/(α·σ_y))^p dΩ.
-        Constraint σ_c^p - 1 ≤ 0 is equivalent to σ_c ≤ 1, Lecture 12 slide 4.
+        Returns σ_c - 1 where σ_c = ((1/|Ω|) ∫ (σ_m/(α·σ_y))^p dΩ)^(1/p).
+        Constraint σ_c - 1 ≤ 0, Lecture 11 slide 12 or Lecture 12 slide 4.
         """
         sm = self.stress_measure(displacement, rho_bar, sigma_y, epsilon_relaxation)
         area = self.geometry_properties.length * self.geometry_properties.height
         sigma_ref = alpha * sigma_y
         p_const = fa.Constant(float(p))
-        return fa.assemble((sm / sigma_ref) ** p_const * fs.dx) / area - 1.0
+        Ip = fa.assemble((sm / sigma_ref) ** p_const * fs.dx) / area
+        return Ip ** (1.0 / float(p)) - 1.0
 
     def set_up_functionals(self, beta: float, eta_values: List[float],
                            p_stress: Optional[int] = None,
@@ -573,12 +578,12 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         """
         self._set_density_from_petsc(x)
         result = [
-            float(self._Jhat(self._rho)),
-            float(self._Vhat(self._rho)),
-            float(self._Phat(self._rho)),
+            float(self._Jhat(self._rho)),   #compliance constraint 
+            float(self._Vhat(self._rho)),   #volume constraint
+            float(self._Phat(self._rho)),   #pitch constraint (inertia)
         ]
         for Shat in self._Shat:
-            result.append(float(Shat(self._rho)))
+            result.append(float(Shat(self._rho)))   #stress constraint
         return np.array(result)
 
     def g(self, x):
@@ -588,12 +593,12 @@ class BowspritTopOpt(CantileverBeam2dLinear):
         self._set_density_from_petsc(x)
         istart, iend = x.getOwnershipRange()
         rows = [
-            self._Jhat.derivative().vector().get_local()[istart:iend],
-            self._Vhat.derivative().vector().get_local()[istart:iend],
-            self._Phat.derivative().vector().get_local()[istart:iend],
+            self._Jhat.derivative().vector().get_local()[istart:iend],  #compliance constraint
+            self._Vhat.derivative().vector().get_local()[istart:iend],  #volume constraint
+            self._Phat.derivative().vector().get_local()[istart:iend],  #pitch constraint (inertia)
         ]
         for Shat in self._Shat:
-            rows.append(Shat.derivative().vector().get_local()[istart:iend])
+            rows.append(Shat.derivative().vector().get_local()[istart:iend]) #stress constraint
         return np.array(rows)
 
     def _set_density_from_petsc(self, x):
@@ -1176,6 +1181,7 @@ def print_comparison(results3, results4):
 if __name__ == "__main__":
     # Run with: mpiexec -n 6 python bowsprit_topopt.py
     #  processes: task3 uses 3 groups x 2 cores, task4 uses 2 groups x 3 cores.
+    # It takes in the ballpark of 6-8 hours for the simulation due to the fine mesh
     fs.set_log_level(30)
 
     material = MaterialProperties2d(e_modulus=70e9, poisson_ratio=0.33, density=None)
@@ -1189,10 +1195,10 @@ if __name__ == "__main__":
     stress = StressConstraintSettings(
         sigma_y=40e6,
         p_stress_schedule=(2, 2, 4, 4, 8, 8, 16, 32, 64, 128, 200, 300, 300, 400, 400),
-        beta_cap=4.8#9.6,  # 2R/l_e = 2*0.04/(0.5/60) for ny=60 mesh
+        beta_cap=9.6,  # 2R/l_e = 2*0.04/(0.5/60) for ny=60 mesh
     )
     settings = OptimizationSettings(
-        filter_radius=0.02, mesh_size=(460, 60), volume_fraction=0.25, pitch_weight_alpha=2.5, lmax=15, kmax=30, move=0.2, beta_schedule=beta_schedule, stress=stress
+        filter_radius=0.04, mesh_size=(460, 60), volume_fraction=0.25, pitch_weight_alpha=2.5, lmax=15, kmax=30, move=0.2, beta_schedule=beta_schedule, stress=stress
     )
     history_stride = int(os.environ.get("BOWSPRIT_HISTORY_STRIDE", "10"))
     output_root = make_run_directory("plots")
